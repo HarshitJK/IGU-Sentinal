@@ -381,7 +381,22 @@ def main():
     )
     failed += xgb_failed
 
-    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total
+    # Run fusion tests
+    print("\n--- Fusion Layer Tests ---")
+    fusion_total, fusion_failed = load_and_run_tests(
+        "test_fusion",
+        [
+            "test_fusion_high_confidence_multi_layer",
+            "test_fusion_low_confidence_single_layer",
+            "test_fusion_multi_layer_disagreement",
+            "test_fusion_combines_evidence",
+            "test_fusion_returns_valid_alert",
+            "test_fusion_three_layer_agreement",
+        ],
+    )
+    failed += fusion_failed
+
+    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total + fusion_total
     print(f"\n{total - failed}/{total} tests passed")
     return 0 if failed == 0 else 1
 
