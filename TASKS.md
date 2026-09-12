@@ -20,7 +20,7 @@ Each task's checkbox may only be checked after its stated test/PoC passes.
 - [x] Benchmark harness: measure sustained flows/sec and end-to-end latency through the in-process pipeline using synthetic load. Test: harness runs and outputs a concrete throughput/latency number (value itself not asserted, just that it's measured and logged).
 
 ## Phase 3 — Docker / Infra (build last)
-- [ ] `ingest/`: replace fixture-replay with real tshark subprocess capture + feature extraction into FlowRecord. Test: capture a short local pcap replay, confirm extracted FlowRecords match expected fields.
+- [x] `ingest/`: replace fixture-replay with real tshark subprocess capture + feature extraction into FlowRecord. Test: capture a short local pcap replay, confirm extracted FlowRecords match expected fields.
 - [ ] Docker networks: `prod-net`, `enclave-net`.
 - [ ] Diode container: one-way relay (app-level) + iptables/nftables DROP enforcing no return path. Test: from an enclave-net container, ping/curl a prod-net container and confirm failure; log this as proof artifact.
 - [ ] Traffic generator containers on `prod-net` wired to `traffic_gen/`.
