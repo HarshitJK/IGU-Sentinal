@@ -369,7 +369,19 @@ def main():
     )
     failed += isoforest_failed
 
-    total = len(tests) + rules_total + stats_total + isoforest_total
+    # Run XGBoost tests
+    print("\n--- XGBoost Classifier Tests ---")
+    xgb_total, xgb_failed = load_and_run_tests(
+        "test_xgb",
+        [
+            "test_xgb_train",
+            "test_xgb_predict_returns_valid_score",
+            "test_xgb_end_to_end_with_held_out",
+        ],
+    )
+    failed += xgb_failed
+
+    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total
     print(f"\n{total - failed}/{total} tests passed")
     return 0 if failed == 0 else 1
 
