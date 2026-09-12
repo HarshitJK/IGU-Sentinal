@@ -1,19 +1,45 @@
 services:
+  # Diode container: one-way relay with iptables enforcement
+  # Enforces unidirectional traffic via iptables rules
+  diode:
+    image: busybox:latest
+    networks:
+      - prod-net
+      - enclave-net
+    container_name: igusentinel-diode
+    cap_add:
+      - NET_ADMIN
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo 'Diode: setting up iptables one-way relay rules'
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        iptables -P FORWARD DROP
+        iptables -A FORWARD -i eth0 -o eth1 -j ACCEPT
+        iptables -A FORWARD -i eth1 -o eth0 -j DROP
+        echo 'iptables rules: FORWARD DROP default, eth0->eth1 ACCEPT, eth1->eth0 DROP'
+        echo 'Diode online'
+        exec sleep infinity
+    restart: unless-stopped
+
   # Test container on prod-net
   prod-test:
-    image: alpine:latest
+    image: busybox:latest
     networks:
       - prod-net
     command: sleep 3600
     container_name: igusentinel-prod-test
+    restart: unless-stopped
 
   # Test container on enclave-net
   enclave-test:
-    image: alpine:latest
+    image: busybox:latest
     networks:
       - enclave-net
     command: sleep 3600
     container_name: igusentinel-enclave-test
+    restart: unless-stopped
 
 networks:
   prod-net:
