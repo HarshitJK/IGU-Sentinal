@@ -1,0 +1,50 @@
+# Data exfiltration traffic generation config
+# Varies packet sizes, transfer rates, and durations to simulate different exfil scenarios
+# Data exfil: large volumes of data leaving the network (uncommon in unidirectional/diode scenarios,
+# but monitored for stealthy in-band encoding or if a return channel exists)
+
+variants:
+  # Slow exfil (stealth, evades rate detection)
+  - threat_class: data_exfiltration
+    tool: mock
+    source_mode: fixed
+    rate: 5
+    size: 512
+    port: 443
+    duration: 5
+
+  # Faster exfil burst (faster but risks detection)
+  - threat_class: data_exfiltration
+    tool: mock
+    source_mode: fixed
+    rate: 50
+    size: 1024
+    port: 443
+    duration: 5
+
+  # Very large packets (bulk transfer)
+  - threat_class: data_exfiltration
+    tool: mock
+    source_mode: fixed
+    rate: 20
+    size: 1460
+    port: 443
+    duration: 5
+
+  # Randomized sources (distributed exfil from multiple compromised hosts)
+  - threat_class: data_exfiltration
+    tool: mock
+    source_mode: rand
+    rate: 30
+    size: 256
+    port: 443
+    duration: 5
+
+  # Exfil to HTTP (unencrypted, riskier for attacker but possible)
+  - threat_class: data_exfiltration
+    tool: mock
+    source_mode: rand
+    rate: 10
+    size: 800
+    port: 80
+    duration: 5

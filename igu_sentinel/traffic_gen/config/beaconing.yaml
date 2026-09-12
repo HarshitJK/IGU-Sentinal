@@ -1,0 +1,49 @@
+# C2 beaconing (command and control) traffic generation config
+# Varies inter-beacon intervals, packet sizes, and protocols
+# Beacons are regular, low-volume callbacks from compromised hosts to command servers
+
+variants:
+  # Regular beacon: every 300ms (3.3 Hz), small HTTPS packets
+  - threat_class: c2_beaconing
+    tool: mock
+    source_mode: fixed
+    rate: 3.3
+    size: 120
+    port: 443
+    duration: 5
+
+  # Faster beacon: every 100ms (10 Hz), might indicate active data exfil
+  - threat_class: c2_beaconing
+    tool: mock
+    source_mode: fixed
+    rate: 10
+    size: 150
+    port: 443
+    duration: 5
+
+  # Stealthier beacon: less frequent, randomized source
+  - threat_class: c2_beaconing
+    tool: mock
+    source_mode: rand
+    rate: 1
+    size: 100
+    port: 443
+    duration: 5
+
+  # HTTP-based C2 (less common but seen in the wild)
+  - threat_class: c2_beaconing
+    tool: mock
+    source_mode: fixed
+    rate: 5
+    size: 200
+    port: 80
+    duration: 5
+
+  # DNS exfiltration beacon (used to evade some filters)
+  - threat_class: c2_beaconing
+    tool: mock
+    source_mode: rand
+    rate: 2
+    size: 80
+    port: 53
+    duration: 5

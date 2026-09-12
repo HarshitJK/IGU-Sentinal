@@ -1,0 +1,41 @@
+# DGA / DNS tunneling attack traffic generation config
+# Varies query rates, packet sizes, and query patterns
+# DGA: Domain Generation Algorithm creates queries to pseudo-random domains
+# DNS tunneling: exfiltrates data by encoding it in DNS queries
+
+variants:
+  # DGA-style rapid DNS queries to pseudo-random domains
+  - threat_class: dga_dns_tunneling
+    tool: mock
+    source_mode: fixed
+    rate: 50
+    size: 80
+    port: 53
+    duration: 5
+
+  # Faster DGA with randomized sources (harder to filter)
+  - threat_class: dga_dns_tunneling
+    tool: mock
+    source_mode: rand
+    rate: 100
+    size: 100
+    port: 53
+    duration: 5
+
+  # Slow DNS tunnel (data exfil in DNS payloads)
+  - threat_class: dga_dns_tunneling
+    tool: mock
+    source_mode: fixed
+    rate: 5
+    size: 200
+    port: 53
+    duration: 5
+
+  # Larger DNS queries (may carry encoded data)
+  - threat_class: dga_dns_tunneling
+    tool: mock
+    source_mode: rand
+    rate: 20
+    size: 256
+    port: 53
+    duration: 5

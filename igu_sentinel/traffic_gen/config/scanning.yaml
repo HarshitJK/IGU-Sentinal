@@ -1,0 +1,49 @@
+# Scanning / recon traffic generation config
+# Varies port ranges, packet sizes, and source diversity
+# Recon scans probe networks to find live hosts and open ports
+
+variants:
+  # Port sweep: many destinations, fixed source
+  - threat_class: recon_scanning
+    tool: mock
+    source_mode: fixed
+    rate: 100
+    size: 64
+    port: 80
+    duration: 5
+
+  # More aggressive sweep: randomized sources to evade rate-limit rules
+  - threat_class: recon_scanning
+    tool: mock
+    source_mode: rand
+    rate: 150
+    size: 64
+    port: 80
+    duration: 5
+
+  # SSH reconnaissance (very common)
+  - threat_class: recon_scanning
+    tool: mock
+    source_mode: rand
+    rate: 50
+    size: 100
+    port: 22
+    duration: 5
+
+  # HTTPS port enumeration
+  - threat_class: recon_scanning
+    tool: mock
+    source_mode: fixed
+    rate: 75
+    size: 80
+    port: 443
+    duration: 5
+
+  # DNS enumeration (zone transfer attempts, DNS queries)
+  - threat_class: recon_scanning
+    tool: mock
+    source_mode: rand
+    rate: 30
+    size: 120
+    port: 53
+    duration: 5

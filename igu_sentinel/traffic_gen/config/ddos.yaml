@@ -1,0 +1,40 @@
+# DDoS (volumetric) attack traffic generation config
+# Varies source-IP mode, rate, packet size, and target port
+# Never rely on one tool's default parameters - we vary them to learn attack patterns, not tool fingerprints
+
+variants:
+  # High-rate volumetric attack, fixed source
+  - threat_class: volumetric_ddos
+    tool: mock
+    source_mode: fixed
+    rate: 1000
+    size: 64
+    port: 80
+    duration: 5
+
+  # High-rate attack with randomized sources (harder to filter)
+  - threat_class: volumetric_ddos
+    tool: mock
+    source_mode: rand
+    rate: 1000
+    size: 64
+    port: 80
+    duration: 5
+
+  # Larger packet DDoS (bandwidth-focused)
+  - threat_class: volumetric_ddos
+    tool: mock
+    source_mode: fixed
+    rate: 500
+    size: 1500
+    port: 443
+    duration: 5
+
+  # Lower-rate attack to different port
+  - threat_class: volumetric_ddos
+    tool: mock
+    source_mode: rand
+    rate: 100
+    size: 128
+    port: 53
+    duration: 5
