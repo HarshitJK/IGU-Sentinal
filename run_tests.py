@@ -276,21 +276,12 @@ def test_fixture_schema_compliance():
     return True
 
 
-def load_and_run_rules_tests():
-    """Dynamically load and run rules tests."""
-    import sys
+def load_and_run_tests(module_name: str, test_names: list[str]) -> tuple[int, int]:
+    """Dynamically load and run tests from a module."""
     sys.path.insert(0, str(Path(__file__).parent))
-    from tests import test_rules
+    module = __import__(f"tests.{module_name}", fromlist=test_names)
 
-    tests = [
-        test_rules.test_rules_detect_benign,
-        test_rules.test_rules_detect_ddos,
-        test_rules.test_rules_detect_beaconing,
-        test_rules.test_rules_detect_dga,
-        test_rules.test_rules_detect_scanning,
-        test_rules.test_rules_returns_layer_score,
-        test_rules.test_rules_unusual_ports,
-    ]
+    tests = [getattr(module, name) for name in test_names]
 
     failed = 0
     for test in tests:
@@ -336,10 +327,36 @@ def main():
 
     # Run rules tests
     print("\n--- Rules Detector Tests ---")
-    rules_total, rules_failed = load_and_run_rules_tests()
+    rules_total, rules_failed = load_and_run_tests(
+        "test_rules",
+        [
+            "test_rules_detect_benign",
+            "test_rules_detect_ddos",
+            "test_rules_detect_beaconing",
+            "test_rules_detect_dga",
+            "test_rules_detect_scanning",
+            "test_rules_returns_layer_score",
+            "test_rules_unusual_ports",
+        ],
+    )
     failed += rules_failed
 
-    total = len(tests) + rules_total
+    # Run stats tests
+    print("\n--- Stats Detector Tests ---")
+    stats_total, stats_failed = load_and_run_tests(
+        "test_stats",
+        [
+            "test_stats_train_baseline",
+            "test_stats_detect_benign_low",
+            "test_stats_detect_ddos_high",
+            "test_stats_detect_beaconing_high",
+            "test_stats_detect_exfil_high",
+            "test_stats_returns_valid_score",
+        ],
+    )
+    failed += stats_failed
+
+    total = len(tests) + rules_total + stats_total
     print(f"\n{total - failed}/{total} tests passed")
     return 0 if failed == 0 else 1
 
