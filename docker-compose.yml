@@ -1,4 +1,18 @@
 services:
+  # Sentinel service: main FastAPI app orchestrating the detection pipeline
+  sentinel:
+    build: .
+    container_name: igusentinel-sentinel
+    networks:
+      - prod-net
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    depends_on:
+      - diode
+
   # Diode container: one-way relay with iptables enforcement
   # Enforces unidirectional traffic via iptables rules
   diode:
