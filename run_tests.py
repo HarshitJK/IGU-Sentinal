@@ -276,6 +276,36 @@ def test_fixture_schema_compliance():
     return True
 
 
+def load_and_run_rules_tests():
+    """Dynamically load and run rules tests."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from tests import test_rules
+
+    tests = [
+        test_rules.test_rules_detect_benign,
+        test_rules.test_rules_detect_ddos,
+        test_rules.test_rules_detect_beaconing,
+        test_rules.test_rules_detect_dga,
+        test_rules.test_rules_detect_scanning,
+        test_rules.test_rules_returns_layer_score,
+        test_rules.test_rules_unusual_ports,
+    ]
+
+    failed = 0
+    for test in tests:
+        try:
+            result = test()
+            if result is False:
+                failed += 1
+        except Exception as e:
+            print(f"✗ {test.__name__} raised unexpected error:")
+            traceback.print_exc()
+            failed += 1
+
+    return len(tests), failed
+
+
 def main():
     """Run all tests."""
     tests = [
@@ -304,7 +334,13 @@ def main():
             traceback.print_exc()
             failed += 1
 
-    print(f"\n{len(tests) - failed}/{len(tests)} tests passed")
+    # Run rules tests
+    print("\n--- Rules Detector Tests ---")
+    rules_total, rules_failed = load_and_run_rules_tests()
+    failed += rules_failed
+
+    total = len(tests) + rules_total
+    print(f"\n{total - failed}/{total} tests passed")
     return 0 if failed == 0 else 1
 
 
