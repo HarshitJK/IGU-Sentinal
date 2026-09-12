@@ -411,7 +411,23 @@ def main():
     )
     failed += alert_failed
 
-    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total + fusion_total + alert_total
+    # Run drift tests
+    print("\n--- Drift Detection Tests ---")
+    drift_total, drift_failed = load_and_run_tests(
+        "test_drift",
+        [
+            "test_drift_compute_psi_no_drift",
+            "test_drift_compute_psi_with_drift",
+            "test_drift_monitor_no_drift",
+            "test_drift_monitor_detects_drift",
+            "test_drift_trigger_retrain",
+            "test_drift_bounded_retrain_preserves_baseline",
+            "test_drift_rolling_window",
+        ],
+    )
+    failed += drift_failed
+
+    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total + fusion_total + alert_total + drift_total
     print(f"\n{total - failed}/{total} tests passed")
     return 0 if failed == 0 else 1
 
