@@ -396,7 +396,22 @@ def main():
     )
     failed += fusion_failed
 
-    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total + fusion_total
+    # Run alert tests
+    print("\n--- Alert Logging Tests ---")
+    alert_total, alert_failed = load_and_run_tests(
+        "test_alert",
+        [
+            "test_alert_log_single",
+            "test_alert_log_chain_integrity",
+            "test_alert_verify_valid_chain",
+            "test_alert_verify_detects_tampering",
+            "test_alert_verify_detects_hash_tampering",
+            "test_alert_empty_log_verification",
+        ],
+    )
+    failed += alert_failed
+
+    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total + fusion_total + alert_total
     print(f"\n{total - failed}/{total} tests passed")
     return 0 if failed == 0 else 1
 
