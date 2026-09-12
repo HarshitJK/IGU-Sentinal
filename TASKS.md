@@ -5,7 +5,7 @@ Each task's checkbox may only be checked after its stated test/PoC passes.
 
 ## Phase 1 — Skeleton
 - [x] Create `igu_sentinel/` package layout exactly as specified in CLAUDE.md (empty modules with docstrings + type-annotated function/class stubs for each contract: FlowRecord, LayerScore, Alert as pydantic models in a shared `schemas.py`). Test: importing each module and instantiating each schema with valid + invalid sample data raises/passes as expected (pydantic validation).
-- [ ] Create `tests/fixtures/` with one hand-crafted JSONL sample per threat class (benign, volumetric_ddos, c2_beaconing, dga_dns_tunneling, encrypted_malware, recon_scanning, data_exfiltration) — 5-10 FlowRecords each, matching the schema. Test: every fixture file parses into valid FlowRecord objects with zero schema errors.
+- [x] Create `tests/fixtures/` with one hand-crafted JSONL sample per threat class (benign, volumetric_ddos, c2_beaconing, dga_dns_tunneling, encrypted_malware, recon_scanning, data_exfiltration) — 5-10 FlowRecords each, matching the schema. Test: every fixture file parses into valid FlowRecord objects with zero schema errors.
 
 ## Phase 2 — Backend / ML
 - [ ] `detect/rules.py`: static IOC/protocol-violation rule engine. Write tests against fixtures first (expected LayerScore per fixture), then implement to pass.

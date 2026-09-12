@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Simple test runner without pytest dependency."""
 import sys
+import json
 import traceback
 from datetime import datetime
+from pathlib import Path
 from pydantic import ValidationError
 
 # Import schemas
@@ -177,6 +179,103 @@ def test_module_imports():
     return True
 
 
+def test_fixture_files_exist():
+    """All fixture files should exist."""
+    fixtures_dir = Path(__file__).parent / "tests" / "fixtures"
+    threat_classes = [
+        "benign",
+        "volumetric_ddos",
+        "c2_beaconing",
+        "dga_dns_tunneling",
+        "encrypted_malware",
+        "recon_scanning",
+        "data_exfiltration",
+    ]
+    for threat_class in threat_classes:
+        fixture_file = fixtures_dir / f"{threat_class}_sample.jsonl"
+        if not fixture_file.exists():
+            print(f"✗ Fixture file {fixture_file} does not exist")
+            return False
+    print("✓ test_fixture_files_exist passed")
+    return True
+
+
+def test_fixtures_parse_as_flow_records():
+    """All fixture files should parse into valid FlowRecords."""
+    fixtures_dir = Path(__file__).parent / "tests" / "fixtures"
+    threat_classes = [
+        "benign",
+        "volumetric_ddos",
+        "c2_beaconing",
+        "dga_dns_tunneling",
+        "encrypted_malware",
+        "recon_scanning",
+        "data_exfiltration",
+    ]
+    for threat_class in threat_classes:
+        fixture_file = fixtures_dir / f"{threat_class}_sample.jsonl"
+        flows = []
+
+        with open(fixture_file) as f:
+            for line in f:
+                if line.strip():
+                    data = json.loads(line)
+                    flow = FlowRecord(**data)
+                    flows.append(flow)
+
+        if len(flows) < 5:
+            print(
+                f"✗ {threat_class} has {len(flows)} flows, "
+                f"expected at least 5"
+            )
+            return False
+    print("✓ test_fixtures_parse_as_flow_records passed")
+    return True
+
+
+def test_fixture_schema_compliance():
+    """All fixture flows should have correct required fields."""
+    fixtures_dir = Path(__file__).parent / "tests" / "fixtures"
+    threat_classes = [
+        "benign",
+        "volumetric_ddos",
+        "c2_beaconing",
+        "dga_dns_tunneling",
+        "encrypted_malware",
+        "recon_scanning",
+        "data_exfiltration",
+    ]
+    required_fields = {
+        "flow_id",
+        "timestamp",
+        "src_port",
+        "dst_port",
+        "protocol",
+        "packet_size_stats",
+        "inter_arrival_stats",
+        "entropy",
+        "byte_ratio",
+        "ttl",
+    }
+
+    for threat_class in threat_classes:
+        fixture_file = fixtures_dir / f"{threat_class}_sample.jsonl"
+
+        with open(fixture_file) as f:
+            for line_num, line in enumerate(f, 1):
+                if line.strip():
+                    data = json.loads(line)
+                    missing_fields = required_fields - set(data.keys())
+                    if missing_fields:
+                        print(
+                            f"✗ Line {line_num} in {threat_class} "
+                            f"missing fields: {missing_fields}"
+                        )
+                        return False
+    print("✓ test_fixture_schema_compliance passed")
+    return True
+
+
 def main():
     """Run all tests."""
     tests = [
@@ -189,6 +288,9 @@ def main():
         test_invalid_threat_class,
         test_valid_threat_classes,
         test_module_imports,
+        test_fixture_files_exist,
+        test_fixtures_parse_as_flow_records,
+        test_fixture_schema_compliance,
     ]
 
     failed = 0
