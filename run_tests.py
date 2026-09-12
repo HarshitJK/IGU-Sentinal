@@ -356,7 +356,20 @@ def main():
     )
     failed += stats_failed
 
-    total = len(tests) + rules_total + stats_total
+    # Run isolation forest tests
+    print("\n--- Isolation Forest Detector Tests ---")
+    isoforest_total, isoforest_failed = load_and_run_tests(
+        "test_isoforest",
+        [
+            "test_isoforest_train",
+            "test_isoforest_scores_benign_low",
+            "test_isoforest_scores_attacks_high",
+            "test_isoforest_returns_valid_score",
+        ],
+    )
+    failed += isoforest_failed
+
+    total = len(tests) + rules_total + stats_total + isoforest_total
     print(f"\n{total - failed}/{total} tests passed")
     return 0 if failed == 0 else 1
 

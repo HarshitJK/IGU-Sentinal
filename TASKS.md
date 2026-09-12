@@ -10,7 +10,7 @@ Each task's checkbox may only be checked after its stated test/PoC passes.
 ## Phase 2 — Backend / ML
 - [x] `detect/rules.py`: static IOC/protocol-violation rule engine. Write tests against fixtures first (expected LayerScore per fixture), then implement to pass.
 - [x] `detect/stats.py`: z-score baseline detector. Tests first, then implement.
-- [ ] `detect/isoforest.py`: Isolation Forest wrapper — train-on-benign-fixture function + score function. Test: scores benign fixtures low, attack fixtures high (relative ordering, not exact values).
+- [x] `detect/isoforest.py`: Isolation Forest wrapper — train-on-benign-fixture function + score function. Test: scores benign fixtures low, attack fixtures high (relative ordering, not exact values).
 - [ ] `detect/xgb.py`: XGBoost multi-class classifier wrapper — train function + predict function. Test: per-class precision/recall computed on a held-out split of fixtures, reported (not asserted to a specific number yet — just must run end-to-end and report).
 - [ ] `fusion/`: Platt-scaling calibration per layer + cross-layer correlation logic (>=2 layers must agree for high-confidence tier). Test: feed known LayerScore combinations, assert correct confidence tier and that single-layer-only detections are downgraded.
 - [ ] `alert/`: Alert schema output + SHA-256 hash-chained logging. Test: log a sequence of alerts, verify hash chain integrity (tampering with one entry breaks verification).
