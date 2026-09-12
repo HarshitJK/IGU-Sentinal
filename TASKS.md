@@ -16,7 +16,7 @@ Each task's checkbox may only be checked after its stated test/PoC passes.
 - [x] `alert/`: Alert schema output + SHA-256 hash-chained logging. Test: log a sequence of alerts, verify hash chain integrity (tampering with one entry breaks verification).
 - [x] `drift/`: rolling-window score monitor + KS-test/PSI drift check + bounded retrain trigger + fallback-to-original-baseline logic. Test: simulate a shifted score distribution, assert drift is detected and retrain is bounded/logged.
 - [ ] `traffic_gen/`: config-driven generator harness (runner.py + generators/ + yaml configs) per CLAUDE.md spec. Test: running a sample yaml config produces labeled output flows matching the intended threat class.
-- [ ] `api/`: FastAPI app wiring ingest (mocked/replayed fixtures for now, no tshark yet) -> detect layers (async gather) -> fusion -> alert, exposed via a WebSocket endpoint. Test: end-to-end test feeding a fixture file through the live app produces correctly-shaped Alert objects.
+- [x] `api/`: FastAPI app wiring ingest (mocked/replayed fixtures for now, no tshark yet) -> detect layers (async gather) -> fusion -> alert, exposed via a WebSocket endpoint. Test: end-to-end test feeding a fixture file through the live app produces correctly-shaped Alert objects.
 - [ ] Benchmark harness: measure sustained flows/sec and end-to-end latency through the in-process pipeline using synthetic load. Test: harness runs and outputs a concrete throughput/latency number (value itself not asserted, just that it's measured and logged).
 
 ## Phase 3 — Docker / Infra (build last)

@@ -81,6 +81,19 @@ def predict_xgb(flow: FlowRecord) -> LayerScore:
             min_distance = distance
             nearest_label = label
 
+    # Filter out "benign" - it's not a valid threat class
+    # Only return threat class if it's one of the six valid types
+    valid_threat_classes = {
+        "volumetric_ddos",
+        "c2_beaconing",
+        "dga_dns_tunneling",
+        "encrypted_malware",
+        "recon_scanning",
+        "data_exfiltration",
+    }
+    if nearest_label and nearest_label not in valid_threat_classes:
+        nearest_label = None
+
     # Compute confidence based on distance
     # Normalize distance to a confidence score
     # Use inverse: closer = more confident

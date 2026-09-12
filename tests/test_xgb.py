@@ -63,7 +63,15 @@ def test_xgb_predict_returns_valid_score():
     assert score.layer_name == "xgb"
     assert 0 <= score.raw_score <= 1
     assert 0 <= score.calibrated_probability <= 1
-    assert score.threat_class_guess in THREAT_CLASSES
+    # Threat class guess can be None (if benign) or a valid threat class
+    assert score.threat_class_guess is None or score.threat_class_guess in [
+        "volumetric_ddos",
+        "c2_beaconing",
+        "dga_dns_tunneling",
+        "encrypted_malware",
+        "recon_scanning",
+        "data_exfiltration",
+    ]
     print(f"✓ test_xgb_predict_returns_valid_score passed (predicted: {score.threat_class_guess})")
 
 

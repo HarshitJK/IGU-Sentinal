@@ -427,7 +427,22 @@ def main():
     )
     failed += drift_failed
 
-    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total + fusion_total + alert_total + drift_total
+    # Run API tests
+    print("\n--- API Pipeline Tests ---")
+    api_total, api_failed = load_and_run_tests(
+        "test_api",
+        [
+            "test_api_pipeline_benign",
+            "test_api_pipeline_attack",
+            "test_api_pipeline_mixed",
+            "test_api_pipeline_returns_valid_alerts",
+            "test_api_pipeline_preserves_flow_ids",
+            "test_api_pipeline_end_to_end",
+        ],
+    )
+    failed += api_failed
+
+    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total + fusion_total + alert_total + drift_total + api_total
     print(f"\n{total - failed}/{total} tests passed")
     return 0 if failed == 0 else 1
 
