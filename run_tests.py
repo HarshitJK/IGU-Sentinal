@@ -453,7 +453,20 @@ def main():
     )
     failed += bench_failed
 
-    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total + fusion_total + alert_total + drift_total + api_total + bench_total
+    # Run traffic_gen tests
+    print("\n--- Traffic Generator Tests ---")
+    traffic_gen_total, traffic_gen_failed = load_and_run_tests(
+        "test_traffic_gen",
+        [
+            "test_traffic_gen_loads_config",
+            "test_traffic_gen_produces_labeled_flows",
+            "test_traffic_gen_matches_intent_threat_class",
+            "test_traffic_gen_config_params",
+        ],
+    )
+    failed += traffic_gen_failed
+
+    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total + fusion_total + alert_total + drift_total + api_total + bench_total + traffic_gen_total
     print(f"\n{total - failed}/{total} tests passed")
     return 0 if failed == 0 else 1
 
