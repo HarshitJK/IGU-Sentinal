@@ -21,7 +21,7 @@ Each task's checkbox may only be checked after its stated test/PoC passes.
 
 ## Phase 3 — Docker / Infra (build last)
 - [x] `ingest/`: replace fixture-replay with real tshark subprocess capture + feature extraction into FlowRecord. Test: capture a short local pcap replay, confirm extracted FlowRecords match expected fields.
-- [ ] Docker networks: `prod-net`, `enclave-net`.
+- [x] Docker networks: `prod-net`, `enclave-net`.
 - [ ] Diode container: one-way relay (app-level) + iptables/nftables DROP enforcing no return path. Test: from an enclave-net container, ping/curl a prod-net container and confirm failure; log this as proof artifact.
 - [ ] Traffic generator containers on `prod-net` wired to `traffic_gen/`.
 - [ ] `docker-compose.yml` tying it all together. Test: `docker-compose up` brings up the full pipeline end-to-end, ping test still fails as expected.

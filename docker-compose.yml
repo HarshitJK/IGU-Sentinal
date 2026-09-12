@@ -1,0 +1,25 @@
+services:
+  # Test container on prod-net
+  prod-test:
+    image: alpine:latest
+    networks:
+      - prod-net
+    command: sleep 3600
+    container_name: igusentinel-prod-test
+
+  # Test container on enclave-net
+  enclave-test:
+    image: alpine:latest
+    networks:
+      - enclave-net
+    command: sleep 3600
+    container_name: igusentinel-enclave-test
+
+networks:
+  prod-net:
+    driver: bridge
+    name: prod-net
+
+  enclave-net:
+    driver: bridge
+    name: enclave-net
