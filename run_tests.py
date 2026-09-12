@@ -442,7 +442,18 @@ def main():
     )
     failed += api_failed
 
-    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total + fusion_total + alert_total + drift_total + api_total
+    # Run benchmark tests
+    print("\n--- Benchmark Performance Tests ---")
+    bench_total, bench_failed = load_and_run_tests(
+        "test_benchmark",
+        [
+            "test_benchmark_throughput",
+            "test_benchmark_latency",
+        ],
+    )
+    failed += bench_failed
+
+    total = len(tests) + rules_total + stats_total + isoforest_total + xgb_total + fusion_total + alert_total + drift_total + api_total + bench_total
     print(f"\n{total - failed}/{total} tests passed")
     return 0 if failed == 0 else 1
 
