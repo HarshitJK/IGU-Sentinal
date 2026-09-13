@@ -6,7 +6,7 @@
 variants:
   # DGA-style rapid DNS queries to pseudo-random domains
   - threat_class: dga_dns_tunneling
-    tool: mock
+    tool: dns_tunneling
     source_mode: fixed
     rate: 50
     size: 80
@@ -15,7 +15,7 @@ variants:
 
   # Faster DGA with randomized sources (harder to filter)
   - threat_class: dga_dns_tunneling
-    tool: mock
+    tool: dns_tunneling
     source_mode: rand
     rate: 100
     size: 100
@@ -24,7 +24,7 @@ variants:
 
   # Slow DNS tunnel (data exfil in DNS payloads)
   - threat_class: dga_dns_tunneling
-    tool: mock
+    tool: dns_tunneling
     source_mode: fixed
     rate: 5
     size: 200
@@ -33,7 +33,7 @@ variants:
 
   # Larger DNS queries (may carry encoded data)
   - threat_class: dga_dns_tunneling
-    tool: mock
+    tool: dns_tunneling
     source_mode: rand
     rate: 20
     size: 256

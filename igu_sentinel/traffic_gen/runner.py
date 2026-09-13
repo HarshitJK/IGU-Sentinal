@@ -3,7 +3,15 @@ from pathlib import Path
 from typing import List, Dict, Any
 import yaml
 from igu_sentinel.schemas import FlowRecord
-from igu_sentinel.traffic_gen.generators import mock, ddos, beaconing, scanning
+from igu_sentinel.traffic_gen.generators import (
+    mock,
+    ddos,
+    beaconing,
+    scanning,
+    dns_tunneling,
+    encrypted_malware,
+    exfiltration,
+)
 
 
 # Mapping from tool name to generator function
@@ -12,6 +20,9 @@ GENERATOR_MAP = {
     "ddos": ddos.generate,
     "beaconing": beaconing.generate,
     "scanning": scanning.generate,
+    "dns_tunneling": dns_tunneling.generate,
+    "encrypted_malware": encrypted_malware.generate,
+    "exfiltration": exfiltration.generate,
 }
 
 

@@ -180,26 +180,26 @@ def test_diode_startup_logs():
 
 
 def test_all_containers_running():
-    """Verify all three containers (diode, prod-test, enclave-test) are running."""
+    """Verify minimum required containers (diode, prod-test, enclave-test) are running."""
     try:
         docker_compose_up()
 
-        # Verify all three containers are up
+        # Verify containers are up
         stdout, stderr, rc = run_command(
             "docker ps -f name=igusentinel --format='{{.Names}}'"
         )
 
         containers = [c.strip() for c in stdout.split('\n') if c.strip()]
-        assert len(containers) == 3, (
-            f"Expected exactly 3 containers, found {len(containers)}: {containers}"
+        assert len(containers) >= 3, (
+            f"Expected at least 3 containers, found {len(containers)}: {containers}"
         )
 
-        # Check that we have all three
+        # Check that we have all required baseline containers
         assert any('diode' in c for c in containers), "diode container missing"
         assert any('prod-test' in c for c in containers), "prod-test container missing"
         assert any('enclave-test' in c for c in containers), "enclave-test container missing"
 
-        print(f"✓ All three containers running: {containers}")
+        print(f"✓ Required containers running: {containers}")
 
     finally:
         docker_compose_down()

@@ -27,7 +27,7 @@ def generate(
     Returns:
         List of synthetic FlowRecord objects.
     """
-    num_flows = max(1, rate * duration)
+    num_flows = int(max(1, rate * duration))
     flows = []
     base_time = datetime.now()
 

@@ -6,7 +6,7 @@
 variants:
   # Slow exfil (stealth, evades rate detection)
   - threat_class: data_exfiltration
-    tool: mock
+    tool: exfiltration
     source_mode: fixed
     rate: 5
     size: 512
@@ -15,7 +15,7 @@ variants:
 
   # Faster exfil burst (faster but risks detection)
   - threat_class: data_exfiltration
-    tool: mock
+    tool: exfiltration
     source_mode: fixed
     rate: 50
     size: 1024
@@ -24,7 +24,7 @@ variants:
 
   # Very large packets (bulk transfer)
   - threat_class: data_exfiltration
-    tool: mock
+    tool: exfiltration
     source_mode: fixed
     rate: 20
     size: 1460
@@ -33,7 +33,7 @@ variants:
 
   # Randomized sources (distributed exfil from multiple compromised hosts)
   - threat_class: data_exfiltration
-    tool: mock
+    tool: exfiltration
     source_mode: rand
     rate: 30
     size: 256
@@ -42,7 +42,7 @@ variants:
 
   # Exfil to HTTP (unencrypted, riskier for attacker but possible)
   - threat_class: data_exfiltration
-    tool: mock
+    tool: exfiltration
     source_mode: rand
     rate: 10
     size: 800
