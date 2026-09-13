@@ -60,10 +60,10 @@ def run_traffic_gen(config_path: str) -> List[Dict[str, Any]]:
         flows = generator_fn(
             threat_class=threat_class,
             source_mode=source_mode,
-            rate=rate,
-            size=size,
-            port=port,
-            duration=duration,
+            rate=max(1, int(rate)),
+            size=int(size),
+            port=int(port),
+            duration=int(duration),
         )
 
         # Label each flow with its threat class

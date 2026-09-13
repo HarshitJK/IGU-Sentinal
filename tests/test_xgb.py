@@ -132,5 +132,3 @@ def test_xgb_end_to_end_with_held_out():
         metrics = per_class_metrics[threat_class]
         if metrics["samples"] > 0:
             print(f"    {threat_class:20s}: {metrics['precision']:.2f} / {metrics['recall']:.2f} / {metrics['f1']:.2f} ({metrics['samples']} samples)")
-
-    return True

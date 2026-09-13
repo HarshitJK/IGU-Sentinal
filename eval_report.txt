@@ -1,0 +1,88 @@
+======================================================================
+IGU SENTINEL — MODEL EVALUATION REPORT
+======================================================================
+
+Train set: 930 flows
+Test  set: 112 flows
+  benign                   : train=  75  test=  75
+  volumetric_ddos          : train= 150  test=   8
+  c2_beaconing             : train= 105  test=   6
+  dga_dns_tunneling        : train= 150  test=   5
+  encrypted_malware        : train= 150  test=   5
+  recon_scanning           : train= 150  test=   7
+  data_exfiltration        : train= 150  test=   6
+
+Training on train set...
+  ✓ Both models trained successfully
+
+──────────────────────────────────────────────────────────────────────
+ISOLATION FOREST — Binary Anomaly Detection
+  (benign = score < 0.5; anomalous = score >= 0.5)
+──────────────────────────────────────────────────────────────────────
+
+Accuracy          : 0.8393
+Macro Precision   : 0.8355
+Macro Recall      : 0.7910
+Macro F1          : 0.8067
+
+Per-class:
+  benign        P=0.843  R=0.933  F1=0.886  support=75
+  anomalous     P=0.828  R=0.649  F1=0.727  support=37
+
+Confusion matrix (rows=true, cols=pred):
+             benign  anomalou
+-----------------------------
+benign           70         5
+anomalous        13        24
+
+──────────────────────────────────────────────────────────────────────
+XGBOOST — Multi-class Threat Classification (7 classes)
+──────────────────────────────────────────────────────────────────────
+
+Accuracy          : 0.8839
+Macro Precision   : 0.7476
+Macro Recall      : 0.7095
+Macro F1          : 0.6650
+
+Per-class breakdown:
+  Class                      Precision  Recall      F1  Support
+  -------------------------  ---------  ------  ------  -------
+  benign                         1.000   1.000   1.000       75
+  volumetric_ddos                0.400   1.000   0.571        8
+  c2_beaconing                   1.000   1.000   1.000        6
+  dga_dns_tunneling              1.000   0.800   0.889        5
+  encrypted_malware              0.833   1.000   0.909        5
+  recon_scanning                 0.000   0.000   0.000        7
+  data_exfiltration              1.000   0.167   0.286        6
+
+Confusion matrix (rows=true, cols=pred):
+                     benign  volumetr  c2_beaco  dga_dns_  encrypte  recon_sc  data_exf
+---------------------------------------------------------------------------------------
+benign                   75         0         0         0         0         0         0
+volumetric_ddos           0         8         0         0         0         0         0
+c2_beaconing              0         0         6         0         0         0         0
+dga_dns_tunneling         0         0         0         4         1         0         0
+encrypted_malware         0         0         0         0         5         0         0
+recon_scanning            0         7         0         0         0         0         0
+data_exfiltration         0         5         0         0         0         0         1
+
+──────────────────────────────────────────────────────────────────────
+CAVEATS & RISKS
+──────────────────────────────────────────────────────────────────────
+
+  1. Small real-world training set: fixture files contain only 5-10 flows per
+     class.  Synthetic augmentation via traffic_gen/ adds ~150 flows/class but
+     all synthetic data comes from the same mock generator — models may learn
+     generator artefacts rather than true attack patterns.
+
+  2. Overfitting risk: with so few real samples, per-class F1 values near 1.0
+     on the test set should be treated with caution until validated against an
+     independent dataset (CIC-IDS2017/UNSW-NB15 — see CLAUDE.md).
+
+  3. Benign class imbalance: benign flows are jitter-expanded 15× to balance
+     the dataset.  This improves model calibration but may not reflect real
+     production traffic diversity.
+
+  4. Fusion thresholds remain unchanged: fusion requires >=2 layers to agree
+     for high-confidence output.  XGBoost now contributes a proper threat class
+     guess rather than a distance-based proxy, so agreement rates should improve.

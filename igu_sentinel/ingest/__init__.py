@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Tuple
 from statistics import mean, stdev
 from igu_sentinel.schemas import FlowRecord
+from igu_sentinel.ingest.ja4 import parse_tshark_fields_line
 
 
 def _extract_payload_entropy(packet_data: str) -> float:
@@ -46,20 +47,23 @@ def _get_flow_key(packet: Dict[str, Any]) -> Tuple[str, int, str, int, str]:
     """Extract 5-tuple flow key from packet."""
     layers = packet.get("_source", {}).get("layers", {})
 
-    src_ip = layers.get("ip", {}).get("ip_src", "0.0.0.0")
-    dst_ip = layers.get("ip", {}).get("ip_dst", "0.0.0.0")
-    protocol = layers.get("ip", {}).get("ip_proto", "")
+    ip_layer = layers.get("ip", {})
+    src_ip = ip_layer.get("ip.src") or ip_layer.get("ip_src", "0.0.0.0")
+    dst_ip = ip_layer.get("ip.dst") or ip_layer.get("ip_dst", "0.0.0.0")
+    protocol = ip_layer.get("ip.proto") or ip_layer.get("ip_proto", "")
 
     src_port = 0
     dst_port = 0
 
     if "tcp" in layers:
-        src_port = int(layers["tcp"].get("tcp_srcport", 0))
-        dst_port = int(layers["tcp"].get("tcp_dstport", 0))
+        tcp_layer = layers["tcp"]
+        src_port = int(tcp_layer.get("tcp.srcport") or tcp_layer.get("tcp_srcport", 0))
+        dst_port = int(tcp_layer.get("tcp.dstport") or tcp_layer.get("tcp_dstport", 0))
         protocol = "TCP"
     elif "udp" in layers:
-        src_port = int(layers["udp"].get("udp_srcport", 0))
-        dst_port = int(layers["udp"].get("udp_dstport", 0))
+        udp_layer = layers["udp"]
+        src_port = int(udp_layer.get("udp.srcport") or udp_layer.get("udp_srcport", 0))
+        dst_port = int(udp_layer.get("udp.dstport") or udp_layer.get("udp_dstport", 0))
         protocol = "UDP"
 
     return (src_ip, src_port, dst_ip, dst_port, protocol)
@@ -68,18 +72,24 @@ def _get_flow_key(packet: Dict[str, Any]) -> Tuple[str, int, str, int, str]:
 def _get_packet_size(packet: Dict[str, Any]) -> int:
     """Extract packet size from tshark packet."""
     frame = packet.get("_source", {}).get("layers", {}).get("frame", {})
-    frame_len = frame.get("frame_len")
+    frame_len = frame.get("frame.len") or frame.get("frame_len")
     if frame_len:
-        return int(frame_len)
+        try:
+            return int(frame_len)
+        except ValueError:
+            pass
     return 0
 
 
 def _get_ttl(packet: Dict[str, Any]) -> int:
     """Extract TTL from packet."""
     ip_layer = packet.get("_source", {}).get("layers", {}).get("ip", {})
-    ttl = ip_layer.get("ip_ttl")
+    ttl = ip_layer.get("ip.ttl") or ip_layer.get("ip_ttl")
     if ttl:
-        return int(ttl)
+        try:
+            return int(ttl)
+        except ValueError:
+            pass
     return 64  # Default TTL
 
 
@@ -87,11 +97,56 @@ def _get_payload(packet: Dict[str, Any]) -> str:
     """Extract payload hex data from packet."""
     layers = packet.get("_source", {}).get("layers", {})
 
-    # Try to get data layer
+    # Try to get data layer or tcp payload
     if "data" in layers:
-        return layers["data"].get("data_data", "")
+        return layers["data"].get("data.data") or layers["data"].get("data_data", "")
+    if "tcp" in layers and "tcp.payload" in layers["tcp"]:
+        return layers["tcp"]["tcp.payload"].replace(":", "")
 
     return ""
+
+
+def _extract_ja4_map(pcap_path: str) -> Dict[Tuple[str, int, str, int, str], str]:
+    """Extract JA4 fingerprints for TLS/QUIC Client Hello handshakes from pcap.
+
+    Uses tshark with display filter to isolate Client Hellos without inspecting
+    or decrypting any encrypted payload.
+    """
+    ja4_by_flow: Dict[Tuple[str, int, str, int, str], str] = {}
+    cmd = [
+        "tshark",
+        "-r", str(pcap_path),
+        "-Y", "tls.handshake.type == 1",
+        "-T", "fields",
+        "-E", "separator=\t",
+        "-e", "ip.src",
+        "-e", "tcp.srcport",
+        "-e", "udp.srcport",
+        "-e", "ip.dst",
+        "-e", "tcp.dstport",
+        "-e", "udp.dstport",
+        "-e", "tls.handshake.type",
+        "-e", "tls.handshake.version",
+        "-e", "tls.handshake.ciphersuite",
+        "-e", "tls.handshake.extension.type",
+        "-e", "tls.handshake.extensions_alpn_str",
+        "-e", "tls.handshake.extensions_server_name",
+        "-e", "tls.handshake.extensions.supported_version",
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if res.returncode == 0 and res.stdout.strip():
+            for line in res.stdout.strip().split("\n"):
+                line = line.strip()
+                if not line or line.startswith("[") or line.startswith("{"):
+                    continue
+                parsed = parse_tshark_fields_line(line)
+                if parsed:
+                    flow_key, ja4_val = parsed
+                    ja4_by_flow[flow_key] = ja4_val
+    except Exception:
+        pass
+    return ja4_by_flow
 
 
 def extract_flows_from_pcap(pcap_path: str) -> List[FlowRecord]:
@@ -104,6 +159,9 @@ def extract_flows_from_pcap(pcap_path: str) -> List[FlowRecord]:
     Returns:
         List of FlowRecord objects
     """
+    # Extract JA4 fingerprints for any TLS/QUIC handshakes
+    ja4_map = _extract_ja4_map(pcap_path)
+
     # Run tshark to extract packets in JSON format
     try:
         result = subprocess.run(
@@ -145,8 +203,20 @@ def extract_flows_from_pcap(pcap_path: str) -> List[FlowRecord]:
 
         # Get packet timestamp
         frame = packet.get("_source", {}).get("layers", {}).get("frame", {})
-        timestamp_str = frame.get("frame_time_epoch")
-        timestamp = float(timestamp_str) if timestamp_str else 0.0
+        timestamp_str = frame.get("frame.time_epoch") or frame.get("frame_time_epoch") or frame.get("frame.time")
+        timestamp = 0.0
+        if timestamp_str:
+            try:
+                timestamp = float(timestamp_str)
+            except (ValueError, TypeError):
+                try:
+                    clean_ts = str(timestamp_str).rstrip("Z")
+                    if "." in clean_ts:
+                        base, frac = clean_ts.split(".", 1)
+                        clean_ts = f"{base}.{frac[:6]}"
+                    timestamp = datetime.fromisoformat(clean_ts).timestamp()
+                except Exception:
+                    timestamp = 0.0
 
         flows_data[flow_key].append({
             "size": packet_size,
@@ -214,6 +284,9 @@ def extract_flows_from_pcap(pcap_path: str) -> List[FlowRecord]:
             f"{src_ip}:{src_port}:{dst_ip}:{dst_port}:{protocol}".encode()
         ).hexdigest()[:16]
 
+        # Populated for TLS/QUIC flows if Client Hello occurred; None otherwise
+        flow_ja4 = ja4_map.get(flow_key) or ja4_map.get((dst_ip, dst_port, src_ip, src_port, protocol))
+
         # Create FlowRecord
         flow_record = FlowRecord(
             flow_id=flow_id,
@@ -226,7 +299,7 @@ def extract_flows_from_pcap(pcap_path: str) -> List[FlowRecord]:
             entropy=entropy,
             byte_ratio=byte_ratio,
             ttl=int(flow_ttl),
-            ja4=None,  # Would be extracted from TLS in real scenario
+            ja4=flow_ja4,
             beacon_interval_stats=None,
             dns_ngram_entropy=None,
             fanout_count=None,

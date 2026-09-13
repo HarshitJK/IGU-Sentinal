@@ -83,6 +83,23 @@ def detect_rules(flow: FlowRecord) -> LayerScore:
             evidence.append("high_entropy_payload")
             threat_guess = "encrypted_malware"
 
+    # JA4 TLS/QUIC fingerprint inspection (mandated primary signal for encrypted_malware)
+    if flow.ja4:
+        from igu_sentinel.detect.features import is_malicious_ja4, has_no_sni_ja4, has_no_alpn_ja4
+        if is_malicious_ja4(flow.ja4):
+            score += 0.40
+            evidence.append(f"malicious_ja4_fingerprint={flow.ja4}")
+            threat_guess = "encrypted_malware"
+        elif has_no_sni_ja4(flow.ja4) and flow.entropy > 6.5:
+            score += 0.30
+            evidence.append(f"ja4_missing_sni_encrypted={flow.ja4[:10]}")
+            threat_guess = "encrypted_malware"
+        elif has_no_alpn_ja4(flow.ja4) and (flow.dst_port in SUSPICIOUS_PORTS or flow.entropy > 7.2):
+            score += 0.20
+            evidence.append(f"ja4_anomalous_no_alpn={flow.ja4[:10]}")
+            if not threat_guess:
+                threat_guess = "encrypted_malware"
+
     # High entropy indicates encryption (malware or exfiltration)
     if flow.entropy > 7.8:
         score += 0.10

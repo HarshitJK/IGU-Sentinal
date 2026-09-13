@@ -77,7 +77,8 @@ def generate(
             fanout = None
             dns_entropy = None
             beacon_interval = None
-            ja4 = "t13d1618h0_002f,00-02-01_1301-1302-1303-1201-1200_000b-000a-0009-0008_0016,_45,1"
+            # Malware TLS fingerprint: no SNI ('i'), no ALPN ('00')
+            ja4 = "t13i050200_e133e205ac38_000000000000"
 
         elif threat_class == "recon_scanning":
             # Rapid scanning, varied ports
