@@ -15,11 +15,14 @@ services:
 
   # Diode container: one-way relay with iptables enforcement
   # Enforces unidirectional traffic via iptables rules
+  # Attached to both bridge networks (prod-net, enclave-net) and macvlan networks
   diode:
     image: busybox:latest
     networks:
       - prod-net
       - enclave-net
+      - macvlan-prod
+      - macvlan-enclave
     container_name: igusentinel-diode
     cap_add:
       - NET_ADMIN
@@ -34,6 +37,30 @@ services:
         iptables -A FORWARD -i eth1 -o eth0 -j DROP
         echo 'iptables rules: FORWARD DROP default, eth0->eth1 ACCEPT, eth1->eth0 DROP'
         echo 'Diode online'
+        exec sleep infinity
+    restart: unless-stopped
+
+  # Router service: macvlan-attached gateway endpoint for host routing sandbox
+  # Provides stable gateway IPs on macvlan-prod and macvlan-enclave networks
+  # Does not run application logic; host routes traffic through this container
+  router:
+    image: busybox:latest
+    networks:
+      macvlan-prod:
+        ipv4_address: 192.168.2.254
+      macvlan-enclave:
+        ipv4_address: 192.168.3.254
+    container_name: igusentinel-router
+    cap_add:
+      - NET_ADMIN
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo 'Router: gateway endpoint online'
+        echo 'Prod side IP: 192.168.2.254'
+        echo 'Enclave side IP: 192.168.3.254'
+        echo 'Waiting for sandbox setup...'
         exec sleep infinity
     restart: unless-stopped
 
@@ -74,3 +101,25 @@ networks:
   enclave-net:
     driver: bridge
     name: enclave-net
+
+  # Macvlan networks for host-routing sandbox
+  # Attached to host's physical interface (wlp8s0)
+  macvlan-prod:
+    driver: macvlan
+    driver_opts:
+      parent: wlp8s0
+    ipam:
+      config:
+        - subnet: 192.168.2.0/24
+          gateway: 192.168.2.1
+    name: macvlan-prod
+
+  macvlan-enclave:
+    driver: macvlan
+    driver_opts:
+      parent: wlp8s0
+    ipam:
+      config:
+        - subnet: 192.168.3.0/24
+          gateway: 192.168.3.1
+    name: macvlan-enclave
