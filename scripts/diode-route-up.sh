@@ -15,13 +15,27 @@ RULE_PRIORITY_DIODE=100
 RULE_PRIORITY_DNS=50
 
 # 1. Add routing table entry to /etc/iproute2/rt_tables (idempotent: check before appending)
-if ! sudo grep -q "^[0-9]* $ROUTING_TABLE$" /etc/iproute2/rt_tables; then
-    TABLE_NUM=$(sudo awk '{print $1}' /etc/iproute2/rt_tables | sort -n | tail -1)
-    TABLE_NUM=$((TABLE_NUM + 1))
+# Note: /etc/iproute2/rt_tables may not exist on all systems; create if needed
+if [ ! -f /etc/iproute2/rt_tables ]; then
+    echo "Creating /etc/iproute2/rt_tables..."
+    sudo mkdir -p /etc/iproute2
+    echo "255	local" | sudo tee /etc/iproute2/rt_tables > /dev/null
+    echo "254	main" | sudo tee -a /etc/iproute2/rt_tables > /dev/null
+    echo "253	default" | sudo tee -a /etc/iproute2/rt_tables > /dev/null
+    TABLE_NUM=100
+else
+    if sudo grep -q "^[0-9]* $ROUTING_TABLE$" /etc/iproute2/rt_tables; then
+        echo "✓ Routing table entry already exists"
+        TABLE_NUM=""
+    else
+        TABLE_NUM=$(sudo awk '{print $1}' /etc/iproute2/rt_tables | sort -n | tail -1)
+        TABLE_NUM=$((TABLE_NUM + 1))
+    fi
+fi
+
+if [ -n "$TABLE_NUM" ] && [ "$TABLE_NUM" != "" ]; then
     echo "$TABLE_NUM $ROUTING_TABLE" | sudo tee -a /etc/iproute2/rt_tables > /dev/null
     echo "✓ Added routing table entry: $TABLE_NUM $ROUTING_TABLE"
-else
-    echo "✓ Routing table entry already exists"
 fi
 
 # 2. Add default route via router to diode table (idempotent: check before adding)
