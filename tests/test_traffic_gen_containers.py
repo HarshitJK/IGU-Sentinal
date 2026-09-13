@@ -68,7 +68,7 @@ def test_traffic_gen_configs_exist():
 
 
 def test_traffic_gen_containers_defined():
-    """Traffic generator containers should be defined in docker-compose.yml."""
+    """Traffic generator container should be defined in docker-compose.yml."""
     root_dir = Path(__file__).parent.parent
     compose_file = root_dir / "docker-compose.yml"
 
@@ -77,53 +77,34 @@ def test_traffic_gen_containers_defined():
 
     services = compose_config.get('services', {})
 
-    # At least one traffic generator container should exist
-    traffic_gen_services = [
-        s for s in services.keys()
-        if 'traffic' in s.lower() or 'gen' in s.lower()
-    ]
-
-    assert len(traffic_gen_services) > 0, (
-        f"No traffic generator services found in docker-compose.yml. "
+    # Consolidated traffic-gen service should exist
+    assert 'traffic-gen' in services, (
+        f"No traffic-gen service found in docker-compose.yml. "
         f"Available services: {list(services.keys())}"
     )
 
-    print(f"✓ Traffic generator services found: {traffic_gen_services}")
+    print(f"✓ Traffic generator service found: traffic-gen")
 
-    # Verify each traffic gen service is on prod-net
-    for service_name in traffic_gen_services:
-        service = services[service_name]
-        networks = service.get('networks', [])
+    # Verify traffic-gen is on prod-net
+    service = services['traffic-gen']
+    networks = service.get('networks', [])
 
-        # Handle both list and dict formats for networks
-        if isinstance(networks, list):
-            network_names = networks
-        elif isinstance(networks, dict):
-            network_names = list(networks.keys())
-        else:
-            network_names = []
+    if isinstance(networks, list):
+        network_names = networks
+    elif isinstance(networks, dict):
+        network_names = list(networks.keys())
+    else:
+        network_names = []
 
-        assert 'prod-net' in network_names, (
-            f"{service_name} must be on 'prod-net'. Networks: {network_names}"
-        )
+    assert 'prod-net' in network_names, (
+        f"traffic-gen must be on 'prod-net'. Networks: {network_names}"
+    )
+    print(f"  ✓ traffic-gen is on prod-net")
 
-        print(f"  ✓ {service_name} is on prod-net")
-
-        # Verify volume mounts for traffic_gen module
-        volumes = service.get('volumes', [])
-        has_traffic_gen_mount = any('traffic_gen' in str(v) for v in volumes)
-
-        assert has_traffic_gen_mount, (
-            f"{service_name} must have traffic_gen volume mount. "
-            f"Volumes: {volumes}"
-        )
-
-        print(f"    ✓ traffic_gen volume mounted")
-
-        # Verify image is set
-        image = service.get('image')
-        assert image, f"{service_name} must have an image defined"
-        print(f"    ✓ image: {image}")
+    # Verify it builds from Dockerfile (not a raw image with volume mounts)
+    build = service.get('build')
+    assert build, "traffic-gen must have a build context defined"
+    print(f"    ✓ build: {build}")
 
 
 def test_traffic_gen_container_startup():

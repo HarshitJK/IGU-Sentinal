@@ -151,7 +151,7 @@ def test_networks_configured():
 
 
 def test_traffic_generators_configured():
-    """All 6 traffic generators must be configured on prod-net."""
+    """Traffic generator service must be configured on prod-net."""
     root_dir = Path(__file__).parent.parent
     compose_file = root_dir / "docker-compose.yml"
 
@@ -159,30 +159,27 @@ def test_traffic_generators_configured():
         compose_config = yaml.safe_load(f)
 
     services = compose_config["services"]
+    assert "traffic-gen" in services, "Missing traffic-gen service"
 
-    required_generators = [
-        "traffic-gen-ddos",
-        "traffic-gen-beaconing",
-        "traffic-gen-scanning",
-        "traffic-gen-dns",
-        "traffic-gen-malware",
-        "traffic-gen-exfil",
-    ]
+    gen = services["traffic-gen"]
+    networks = gen.get("networks", [])
 
-    for gen_name in required_generators:
-        assert gen_name in services, f"Missing traffic generator: {gen_name}"
+    if isinstance(networks, list):
+        network_names = networks
+    else:
+        network_names = list(networks.keys())
 
-        gen = services[gen_name]
-        networks = gen.get("networks", [])
+    assert "prod-net" in network_names, "traffic-gen must be on prod-net"
 
-        if isinstance(networks, list):
-            network_names = networks
-        else:
-            network_names = list(networks.keys())
+    # Verify it builds from Dockerfile (same as sentinel)
+    assert gen.get("build") == ".", "traffic-gen must build from current directory"
 
-        assert "prod-net" in network_names, f"{gen_name} must be on prod-net"
+    # Verify it runs --all to cover all 6 configs
+    command = gen.get("command", [])
+    command_str = " ".join(command) if isinstance(command, list) else str(command)
+    assert "--all" in command_str, "traffic-gen must run with --all flag"
 
-    print(f"✓ All 6 traffic generators configured on prod-net")
+    print(f"✓ Traffic generator service configured on prod-net (consolidated, --all)")
 
 
 def test_requirements_has_dependencies():

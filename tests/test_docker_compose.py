@@ -148,7 +148,7 @@ def test_all_services_running():
     try:
         docker_compose_up()
 
-        # Verify containers are up (sentinel, 6 traffic generators, diode, 2 test containers)
+        # Verify containers are up (sentinel, traffic-gen, diode, 2 test containers)
         stdout, stderr, rc = run_command(
             "docker ps -f name=igusentinel --format='{{.Names}}'"
         )
@@ -207,9 +207,9 @@ def test_docker_compose_full_pipeline():
             "docker ps -f name=igusentinel --format='{{.Names}}' | wc -l"
         )
         container_count = int(stdout.strip())
-        # Should have: sentinel, diode, 6 traffic-gen, 2 test containers = 10 total
-        assert container_count >= 9, (
-            f"Expected at least 9 containers, found {container_count}"
+        # Should have: sentinel, diode, traffic-gen, 2 test containers = 5 total
+        assert container_count >= 5, (
+            f"Expected at least 5 containers, found {container_count}"
         )
 
         print(f"✓ Full pipeline up with {container_count} containers")

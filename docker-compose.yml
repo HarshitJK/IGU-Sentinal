@@ -55,92 +55,13 @@ services:
     container_name: igusentinel-enclave-test
     restart: unless-stopped
 
-  # Traffic generator: DDoS variant generation
-  traffic-gen-ddos:
-    image: python:3.11-slim
+  # Traffic generator: runs all 6 threat-class configs via runner.py --all
+  traffic-gen:
+    build: .
     networks:
       - prod-net
-    container_name: igusentinel-traffic-gen-ddos
-    working_dir: /app
-    volumes:
-      - ./igu_sentinel:/app/igu_sentinel:ro
-      - ./igu_sentinel/traffic_gen/config/ddos.yaml:/config/ddos.yaml:ro
-    command: python -m igu_sentinel.traffic_gen.runner /config/ddos.yaml
-    restart: on-failure
-    environment:
-      - PYTHONUNBUFFERED=1
-
-  # Traffic generator: C2 beaconing variant generation
-  traffic-gen-beaconing:
-    image: python:3.11-slim
-    networks:
-      - prod-net
-    container_name: igusentinel-traffic-gen-beaconing
-    working_dir: /app
-    volumes:
-      - ./igu_sentinel:/app/igu_sentinel:ro
-      - ./igu_sentinel/traffic_gen/config/beaconing.yaml:/config/beaconing.yaml:ro
-    command: python -m igu_sentinel.traffic_gen.runner /config/beaconing.yaml
-    restart: on-failure
-    environment:
-      - PYTHONUNBUFFERED=1
-
-  # Traffic generator: recon/scanning variant generation
-  traffic-gen-scanning:
-    image: python:3.11-slim
-    networks:
-      - prod-net
-    container_name: igusentinel-traffic-gen-scanning
-    working_dir: /app
-    volumes:
-      - ./igu_sentinel:/app/igu_sentinel:ro
-      - ./igu_sentinel/traffic_gen/config/scanning.yaml:/config/scanning.yaml:ro
-    command: python -m igu_sentinel.traffic_gen.runner /config/scanning.yaml
-    restart: on-failure
-    environment:
-      - PYTHONUNBUFFERED=1
-
-  # Traffic generator: DNS tunneling/DGA variant generation
-  traffic-gen-dns:
-    image: python:3.11-slim
-    networks:
-      - prod-net
-    container_name: igusentinel-traffic-gen-dns
-    working_dir: /app
-    volumes:
-      - ./igu_sentinel:/app/igu_sentinel:ro
-      - ./igu_sentinel/traffic_gen/config/dns_tunneling.yaml:/config/dns_tunneling.yaml:ro
-    command: python -m igu_sentinel.traffic_gen.runner /config/dns_tunneling.yaml
-    restart: on-failure
-    environment:
-      - PYTHONUNBUFFERED=1
-
-  # Traffic generator: encrypted malware variant generation
-  traffic-gen-malware:
-    image: python:3.11-slim
-    networks:
-      - prod-net
-    container_name: igusentinel-traffic-gen-malware
-    working_dir: /app
-    volumes:
-      - ./igu_sentinel:/app/igu_sentinel:ro
-      - ./igu_sentinel/traffic_gen/config/encrypted_malware.yaml:/config/encrypted_malware.yaml:ro
-    command: python -m igu_sentinel.traffic_gen.runner /config/encrypted_malware.yaml
-    restart: on-failure
-    environment:
-      - PYTHONUNBUFFERED=1
-
-  # Traffic generator: data exfiltration variant generation
-  traffic-gen-exfil:
-    image: python:3.11-slim
-    networks:
-      - prod-net
-    container_name: igusentinel-traffic-gen-exfil
-    working_dir: /app
-    volumes:
-      - ./igu_sentinel:/app/igu_sentinel:ro
-      - ./igu_sentinel/traffic_gen/config/exfiltration.yaml:/config/exfiltration.yaml:ro
-    command: python -m igu_sentinel.traffic_gen.runner /config/exfiltration.yaml
+    container_name: igusentinel-traffic-gen
+    command: ["python", "-m", "igu_sentinel.traffic_gen.runner", "--all"]
     restart: on-failure
     environment:
       - PYTHONUNBUFFERED=1
