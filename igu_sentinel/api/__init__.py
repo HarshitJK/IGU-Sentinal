@@ -1,30 +1,75 @@
-"""FastAPI app orchestrating the detection pipeline.
+"""FastAPI app orchestrating the detection pipeline with concurrent layer execution and WebSocket streaming.
 
-Model lifecycle (changed from the old per-request retrain approach):
-  - IsolationForest and XGBoost are loaded ONCE at module import from the
-    persisted files in models/.  If no persisted models exist yet, the service
-    will raise RuntimeError on the first /detect call — run train_models.py
-    before starting the service.
-  - detect/stats.py baseline still needs to be trained on benign flows at
-    startup (it's a rolling z-score baseline, not a persisted model).  We
-    train it once from the benign fixture file.
+Pipeline Architecture:
+  - Detection layers (rules, stats, isoforest, xgb) run CONCURRENTLY per flow via asyncio.gather()
+    and asyncio.to_thread() to offload CPU-bound ML scoring without blocking the event loop.
+  - Fusion correlates LayerScores into an Alert with confidence scoring.
+  - Alert logging applies SHA-256 hash chaining.
+  - Real-time streaming broadcasts alerts over WebSocket at /ws/alerts to connected dashboards.
 """
+import asyncio
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import List, Set
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from igu_sentinel.schemas import FlowRecord, Alert
 from igu_sentinel.detect.rules import detect_rules
 from igu_sentinel.detect.stats import train_stats_baseline, detect_stats
-from igu_sentinel.detect.isoforest import score_isoforest   # model loaded at import
-from igu_sentinel.detect.xgb import predict_xgb             # model loaded at import
+from igu_sentinel.detect.isoforest import score_isoforest   # loaded at import
+from igu_sentinel.detect.xgb import predict_xgb             # loaded at import
 from igu_sentinel.fusion import fuse_layers
+from igu_sentinel.alert import log_alert
 
 log = logging.getLogger(__name__)
-app = FastAPI(title="IGU Sentinel")
+app = FastAPI(title="IGU Sentinel", description="Passive Diode-Fed Threat Detection System")
 
-# ── one-time startup state ────────────────────────────────────────────────────
+# ── WebSocket connection manager ──────────────────────────────────────────────
+class ConnectionManager:
+    """Manages active WebSocket connections for streaming real-time alerts."""
+
+    def __init__(self):
+        self.active_connections: Set[WebSocket] = set()
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.add(websocket)
+        log.info("WebSocket client connected. Active: %d", len(self.active_connections))
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.discard(websocket)
+        log.info("WebSocket client disconnected. Active: %d", len(self.active_connections))
+
+    async def broadcast_alert(self, alert: Alert):
+        """Broadcast an Alert as JSON to all active WebSocket connections."""
+        if not self.active_connections:
+            return
+
+        payload = {
+            "timestamp": alert.timestamp.isoformat(),
+            "flow_id": alert.flow_id,
+            "threat_class": alert.threat_class,
+            "confidence_score": alert.confidence_score,
+            "evidence": alert.evidence,
+        }
+
+        dead_connections = set()
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_json(payload)
+            except Exception:
+                dead_connections.add(connection)
+
+        for dead in dead_connections:
+            self.disconnect(dead)
+
+
+manager = ConnectionManager()
+
+
+# ── One-time startup state ────────────────────────────────────────────────────
 _stats_trained: bool = False
 
 
@@ -53,39 +98,65 @@ def _ensure_stats_baseline() -> None:
     _stats_trained = True
 
 
-# ── pipeline ──────────────────────────────────────────────────────────────────
+# ── Concurrent Detection Pipeline ─────────────────────────────────────────────
 
-def run_detection_pipeline(flows: list[FlowRecord]) -> list[Alert]:
-    """Run the full detection pipeline on a list of FlowRecords.
+async def detect_flow_async(flow: FlowRecord) -> Alert:
+    """Run all 4 detection layers concurrently on a single FlowRecord.
 
-    All models are loaded at module import time (isoforest, xgb).
-    The stats z-score baseline is initialised lazily on first call.
+    CPU-bound scoring functions (sklearn IsolationForest, XGBoost) are executed
+    in worker threads via asyncio.to_thread() to avoid blocking the asyncio event loop.
+    """
+    scores = await asyncio.gather(
+        asyncio.to_thread(detect_rules, flow),
+        asyncio.to_thread(detect_stats, flow),
+        asyncio.to_thread(score_isoforest, flow),
+        asyncio.to_thread(predict_xgb, flow),
+    )
+    return fuse_layers(list(scores))
 
-    Args:
-        flows: List of FlowRecords to process.
 
-    Returns:
-        List of Alert objects, one per input flow.
+async def run_detection_pipeline_async(flows: List[FlowRecord]) -> List[Alert]:
+    """Run the detection pipeline concurrently over a batch of FlowRecords."""
+    if not flows:
+        return []
+    _ensure_stats_baseline()
+    tasks = [detect_flow_async(f) for f in flows]
+    return list(await asyncio.gather(*tasks))
+
+
+def run_detection_pipeline(flows: List[FlowRecord]) -> List[Alert]:
+    """Synchronous pipeline entry point (used by tests, scripts, benchmarks).
+
+    Dispatches detection layers concurrently using ThreadPoolExecutor if an event
+    loop is already running, or via asyncio.run() otherwise.
     """
     if not flows:
         return []
 
     _ensure_stats_baseline()
 
-    alerts: list[Alert] = []
-    for flow in flows:
-        scores = [
-            detect_rules(flow),
-            detect_stats(flow),
-            score_isoforest(flow),
-            predict_xgb(flow),
-        ]
-        alerts.append(fuse_layers(scores))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
 
-    return alerts
+    if loop and loop.is_running():
+        # Inside existing event loop: run layers concurrently across threads
+        with ThreadPoolExecutor(max_workers=min(32, (len(flows) * 4) or 1)) as executor:
+            alerts: List[Alert] = []
+            for flow in flows:
+                f_rules = executor.submit(detect_rules, flow)
+                f_stats = executor.submit(detect_stats, flow)
+                f_iso = executor.submit(score_isoforest, flow)
+                f_xgb = executor.submit(predict_xgb, flow)
+                scores = [f_rules.result(), f_stats.result(), f_iso.result(), f_xgb.result()]
+                alerts.append(fuse_layers(scores))
+            return alerts
+    else:
+        return asyncio.run(run_detection_pipeline_async(flows))
 
 
-# ── FastAPI endpoints ─────────────────────────────────────────────────────────
+# ── FastAPI Endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health_check():
@@ -93,9 +164,26 @@ async def health_check():
     return {"status": "ok", "service": "IGU Sentinel"}
 
 
+@app.websocket("/ws/alerts")
+async def websocket_alerts(websocket: WebSocket):
+    """WebSocket endpoint streaming alerts in real-time as flows are processed."""
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection open; receive client pings/messages if any
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)
+
+
 @app.post("/detect")
 async def detect(flows: list[dict]) -> list[dict]:
     """Run detection pipeline on flows.
+
+    Layers are evaluated concurrently for each flow. Produced alerts are logged
+    with SHA-256 hash chaining and broadcast in real-time to all connected WebSocket clients.
 
     Args:
         flows: List of flow dicts matching FlowRecord schema.
@@ -104,7 +192,13 @@ async def detect(flows: list[dict]) -> list[dict]:
         List of Alert dicts.
     """
     flow_records = [FlowRecord(**f) for f in flows]
-    alerts = run_detection_pipeline(flow_records)
+    alerts = await run_detection_pipeline_async(flow_records)
+
+    # Hash-chained logging and WebSocket real-time broadcast
+    for a in alerts:
+        log_alert(a)
+        await manager.broadcast_alert(a)
+
     return [
         {
             "timestamp": a.timestamp.isoformat(),
