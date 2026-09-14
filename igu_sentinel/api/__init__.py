@@ -10,11 +10,15 @@ Pipeline Architecture:
 import asyncio
 import json
 import logging
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
-from typing import List, Set
+from typing import List, Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from igu_sentinel.schemas import FlowRecord, Alert
 from igu_sentinel.detect.rules import detect_rules
 from igu_sentinel.detect.stats import train_stats_baseline, detect_stats
@@ -22,6 +26,11 @@ from igu_sentinel.detect.isoforest import score_isoforest   # loaded at import
 from igu_sentinel.detect.xgb import predict_xgb             # loaded at import
 from igu_sentinel.fusion import fuse_layers
 from igu_sentinel.alert import log_alert
+from igu_sentinel.ingest import (
+    extract_flows_from_interface,
+    LiveCaptureError,
+    DEFAULT_WINDOW_MS,
+)
 
 log = logging.getLogger(__name__)
 app = FastAPI(title="IGU Sentinel", description="Passive Diode-Fed Threat Detection System")
@@ -67,6 +76,117 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+
+
+# ── Live capture controller ───────────────────────────────────────────────────
+class CaptureController:
+    """Runs a live tshark capture in a background thread and feeds each fixed
+    window's flows through the SAME detection pipeline used by POST /detect,
+    hash-logging every alert and broadcasting it to the SAME /ws/alerts clients.
+
+    The worker isolates all capture failures: a bad interface or missing capture
+    permission is recorded as an error state and never crashes the API process.
+    """
+
+    def __init__(self) -> None:
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event: Optional[threading.Event] = None
+        self._lock = threading.Lock()
+        self.state: dict = {
+            "status": "idle",          # idle | starting | running | stopped | error
+            "interface": None,
+            "window_ms": None,
+            "windows_processed": 0,
+            "alerts_emitted": 0,
+            "error": None,
+            "started_at": None,
+        }
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def snapshot(self) -> dict:
+        s = dict(self.state)
+        s["running"] = self.is_running()
+        return s
+
+    def start(self, interface: str, window_ms: int, loop: asyncio.AbstractEventLoop) -> None:
+        with self._lock:
+            if self.is_running():
+                raise RuntimeError(f"capture already running on '{self.state.get('interface')}'")
+            self._stop_event = threading.Event()
+            self.state = {
+                "status": "starting",
+                "interface": interface,
+                "window_ms": window_ms,
+                "windows_processed": 0,
+                "alerts_emitted": 0,
+                "error": None,
+                "started_at": datetime.now().isoformat(),
+            }
+            self._thread = threading.Thread(
+                target=self._worker,
+                args=(interface, window_ms, loop, self._stop_event),
+                name="live-capture",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _worker(
+        self,
+        interface: str,
+        window_ms: int,
+        loop: asyncio.AbstractEventLoop,
+        stop_event: threading.Event,
+    ) -> None:
+        try:
+            _ensure_stats_baseline()
+            for window_flows in extract_flows_from_interface(interface, window_ms, stop_event):
+                if stop_event.is_set():
+                    break
+                # First yielded window (even empty) confirms capture is live.
+                self.state["status"] = "running"
+                self.state["windows_processed"] += 1
+                if not window_flows:
+                    continue
+                # Same pipeline as POST /detect: rules+stats+isoforest+xgb -> fusion.
+                alerts = run_detection_pipeline(window_flows)
+                for alert in alerts:
+                    log_alert(alert)
+                    self.state["alerts_emitted"] += 1
+                    # Broadcast on the main event loop where the WS clients live.
+                    try:
+                        fut = asyncio.run_coroutine_threadsafe(
+                            manager.broadcast_alert(alert), loop
+                        )
+                        fut.result(timeout=5)
+                    except Exception:
+                        log.exception("live capture: alert broadcast failed")
+        except LiveCaptureError as exc:
+            self.state["status"] = "error"
+            self.state["error"] = str(exc)
+            log.warning("live capture error: %s", exc)
+            return
+        except Exception as exc:  # never let capture crash the service
+            self.state["status"] = "error"
+            self.state["error"] = f"{type(exc).__name__}: {exc}"
+            log.exception("live capture worker crashed")
+            return
+        if self.state.get("status") != "error":
+            self.state["status"] = "stopped"
+
+    def stop(self) -> None:
+        with self._lock:
+            if self._stop_event is not None:
+                self._stop_event.set()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=6)
+        if self.state.get("status") != "error":
+            self.state["status"] = "stopped"
+
+
+capture = CaptureController()
 
 
 # ── One-time startup state ────────────────────────────────────────────────────
@@ -209,3 +329,70 @@ async def detect(flows: list[dict]) -> list[dict]:
         }
         for a in alerts
     ]
+
+
+# ── Live capture control endpoints ────────────────────────────────────────────
+
+@app.post("/capture/start")
+async def capture_start(config: dict):
+    """Start continuous live capture on an interface.
+
+    Body: {"interface": "<name>", "window_ms": 120 (optional)}
+
+    Captured flows are batched per fixed window and pushed through the same
+    detect -> fusion -> alert -> /ws/alerts path as POST /detect. Returns a clear
+    error (HTTP 400) — without crashing the service — if the interface does not
+    exist or cannot be captured on (e.g. missing permission).
+    """
+    config = config or {}
+    interface = config.get("interface")
+    if not interface or not isinstance(interface, str):
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "'interface' (string) is required"},
+        )
+    try:
+        window_ms = int(config.get("window_ms", DEFAULT_WINDOW_MS))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "'window_ms' must be an integer"},
+        )
+    if window_ms <= 0:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "'window_ms' must be positive"},
+        )
+
+    loop = asyncio.get_running_loop()
+    try:
+        capture.start(interface, window_ms, loop)
+    except RuntimeError as exc:
+        return JSONResponse(status_code=409, content={**capture.snapshot(), "error": str(exc)})
+
+    # Wait briefly for the worker to confirm it is live or report a startup error,
+    # so the caller gets a definitive answer (interface valid / permission ok).
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if capture.state.get("status") in ("running", "error"):
+            break
+        await asyncio.sleep(0.05)
+
+    if capture.state.get("status") == "error":
+        return JSONResponse(status_code=400, content=capture.snapshot())
+    return capture.snapshot()
+
+
+@app.post("/capture/stop")
+async def capture_stop():
+    """Stop the active live capture (idempotent)."""
+    if not capture.is_running():
+        return {**capture.snapshot(), "detail": "no active capture"}
+    await asyncio.to_thread(capture.stop)
+    return capture.snapshot()
+
+
+@app.get("/capture/status")
+async def capture_status():
+    """Return the current live-capture status and counters."""
+    return capture.snapshot()

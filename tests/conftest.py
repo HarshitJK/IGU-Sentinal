@@ -41,3 +41,25 @@ def isolate_model_artifacts(request, tmp_path, monkeypatch):
         monkeypatch.setattr(_iso, "_MODELS_DIR", tmp_models)
         monkeypatch.setattr(_xgb, "_MODELS_DIR", tmp_models)
     yield
+
+
+@pytest.fixture(autouse=True)
+def reset_ws_connections():
+    """Clear the shared WebSocket ConnectionManager around every test.
+
+    ``igu_sentinel.api.manager`` is a module-level singleton whose
+    ``active_connections`` set persists across tests. A TestClient WebSocket that
+    is torn down abruptly can leave a stale connection behind; a later test that
+    broadcasts would then block trying to send to that dead socket. Clearing the
+    set before and after each test keeps WebSocket tests hermetic.
+    """
+    def _clear():
+        try:
+            import igu_sentinel.api as _api
+            _api.manager.active_connections.clear()
+        except Exception:
+            pass
+
+    _clear()
+    yield
+    _clear()

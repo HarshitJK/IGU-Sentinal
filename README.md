@@ -142,6 +142,37 @@ make down        # Teardown stack and remove volumes
 make clean       # Clean caches and prompt before removing .venv
 ```
 
+### 3. Live Streaming Capture (P5B)
+
+Run the service, then capture a live interface. Each fixed **120ms window** of
+captured flows is scored by the same detect → fusion → alert pipeline as
+`POST /detect`, and alerts stream to every `/ws/alerts` client in real time.
+
+```bash
+# Start the API
+uvicorn igu_sentinel.api:app --host 0.0.0.0 --port 8000
+
+# Start live capture on an interface (JSON body)
+curl -X POST http://127.0.0.1:8000/capture/start \
+     -H 'Content-Type: application/json' -d '{"interface":"en0","window_ms":120}'
+
+curl http://127.0.0.1:8000/capture/status   # status + windows/alerts counters
+curl -X POST http://127.0.0.1:8000/capture/stop
+```
+
+Live capture endpoints:
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/capture/start` | POST | Begin live capture (`{"interface", "window_ms"?}`) |
+| `/capture/stop`  | POST | Stop the active capture |
+| `/capture/status`| GET  | Current status and windows/alerts counters |
+
+> **Capture permissions:** live capture needs raw-packet access. On macOS install
+> ChmodBPF (`brew install --cask wireshark-chmodbpf`, then re-login) or run under
+> `sudo`; on Linux `sudo setcap cap_net_raw,cap_net_admin+eip $(which tshark)`.
+> A missing/invalid interface or missing permission returns a clear error from
+> `/capture/start` (HTTP 400) and never crashes the service.
+
 ---
 
 ## Performance Benchmark
