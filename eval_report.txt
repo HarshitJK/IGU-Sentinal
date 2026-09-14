@@ -39,21 +39,21 @@ anomalous        13        24
 XGBOOST — Multi-class Threat Classification (7 classes)
 ──────────────────────────────────────────────────────────────────────
 
-Accuracy          : 0.8839
-Macro Precision   : 0.7476
-Macro Recall      : 0.7095
-Macro F1          : 0.6650
+Accuracy          : 0.8929
+Macro Precision   : 0.7726
+Macro Recall      : 0.7333
+Macro F1          : 0.7107
 
 Per-class breakdown:
   Class                      Precision  Recall      F1  Support
   -------------------------  ---------  ------  ------  -------
-  benign                         1.000   1.000   1.000       75
-  volumetric_ddos                0.400   1.000   0.571        8
+  benign                         0.987   1.000   0.993       75
+  volumetric_ddos                0.421   1.000   0.593        8
   c2_beaconing                   1.000   1.000   1.000        6
   dga_dns_tunneling              1.000   0.800   0.889        5
-  encrypted_malware              0.833   1.000   0.909        5
+  encrypted_malware              1.000   1.000   1.000        5
   recon_scanning                 0.000   0.000   0.000        7
-  data_exfiltration              1.000   0.167   0.286        6
+  data_exfiltration              1.000   0.333   0.500        6
 
 Confusion matrix (rows=true, cols=pred):
                      benign  volumetr  c2_beaco  dga_dns_  encrypte  recon_sc  data_exf
@@ -61,10 +61,10 @@ Confusion matrix (rows=true, cols=pred):
 benign                   75         0         0         0         0         0         0
 volumetric_ddos           0         8         0         0         0         0         0
 c2_beaconing              0         0         6         0         0         0         0
-dga_dns_tunneling         0         0         0         4         1         0         0
+dga_dns_tunneling         1         0         0         4         0         0         0
 encrypted_malware         0         0         0         0         5         0         0
 recon_scanning            0         7         0         0         0         0         0
-data_exfiltration         0         5         0         0         0         0         1
+data_exfiltration         0         4         0         0         0         0         2
 
 ──────────────────────────────────────────────────────────────────────
 CAVEATS & RISKS
