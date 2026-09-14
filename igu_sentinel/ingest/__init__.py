@@ -136,6 +136,61 @@ def _get_payload(packet: Dict[str, Any]) -> str:
     return ""
 
 
+
+def _dns_ngram_entropy(names: List[str]) -> Optional[float]:
+    """Character-bigram Shannon entropy over the DNS names queried in a flow.
+
+    Algorithmically-generated domains (DGA) and data smuggled inside DNS labels
+    produce near-random character sequences, so their bigram entropy is far
+    higher than human-registered domains. Returns None when the flow carries no
+    DNS query at all, so non-DNS traffic can never look like DNS tunnelling.
+    """
+    import math
+    labels = []
+    for n in names:
+        for part in str(n).lower().split("."):
+            if part:
+                labels.append(part)
+    joined = "".join(labels)
+    if len(joined) < 3:
+        return None
+    bigrams: Dict[str, int] = defaultdict(int)
+    total = 0
+    for i in range(len(joined) - 1):
+        bigrams[joined[i:i + 2]] += 1
+        total += 1
+    if not total:
+        return None
+    ent = 0.0
+    for c in bigrams.values():
+        pr = c / total
+        ent -= pr * math.log2(pr)
+    return float(ent)
+
+
+def _get_dns_names(packet: Dict[str, Any]) -> List[str]:
+    """Extract DNS query name(s) from a tshark packet, if any."""
+    layers = packet.get("_source", {}).get("layers", {})
+    dns = layers.get("dns")
+    if not dns:
+        return []
+    raw = dns.get("dns.qry.name") or dns.get("dns_qry_name")
+    if raw is None:
+        # tshark may nest queries under a tree node
+        for key, val in dns.items():
+            if key.startswith("Queries") and isinstance(val, dict):
+                for qk in val:
+                    if isinstance(val[qk], dict):
+                        raw = val[qk].get("dns.qry.name")
+                        if raw:
+                            break
+            if raw:
+                break
+    if raw is None:
+        return []
+    return list(raw) if isinstance(raw, list) else [raw]
+
+
 def _extract_ja4_map(pcap_path: str) -> Dict[Tuple[str, int, str, int, str], str]:
     """Extract JA4 fingerprints for TLS/QUIC Client Hello handshakes from pcap.
 
@@ -279,9 +334,24 @@ def _build_flow_records(
             "size": packet_size,
             "ttl": ttl,
             "payload": payload,
-            "timestamp": timestamp
+            "timestamp": timestamp,
+            "dns_names": _get_dns_names(packet),
         })
         packet_times[flow_key].append(timestamp)
+
+    # ── Fan-out: distinct targets contacted by each source within this window ──
+    # This is the primary discriminator between reconnaissance/scanning and a
+    # volumetric flood. A port scan is ONE source touching MANY distinct
+    # (dst_ip, dst_port) targets, so its fan-out is high while its per-target
+    # volume stays tiny. A flood concentrates enormous volume on ONE target, so
+    # its fan-out stays ~1 no matter how fast the packets arrive. Rate-based
+    # features alone cannot tell these apart — both are "many packets, fast".
+    #
+    # Computed per capture window over the flows in that window, because the
+    # 5-tuple FlowRecord itself carries no source/destination IP (schema-fixed).
+    targets_by_source: Dict[str, set] = defaultdict(set)
+    for (f_src_ip, _f_sport, f_dst_ip, f_dst_port, _f_proto) in flows_data:
+        targets_by_source[f_src_ip].add((f_dst_ip, f_dst_port))
 
     # Create FlowRecord for each flow
     flow_records = []
@@ -358,8 +428,12 @@ def _build_flow_records(
             ttl=int(flow_ttl),
             ja4=flow_ja4,
             beacon_interval_stats=None,
-            dns_ngram_entropy=None,
-            fanout_count=None,
+            dns_ngram_entropy=_dns_ngram_entropy(
+                [n for p in packets_info for n in p.get("dns_names", [])]
+            ),
+            # Distinct (dst_ip, dst_port) targets this flow's SOURCE touched in
+            # this window: high => scanning fan-out, ~1 => flood/normal session.
+            fanout_count=len(targets_by_source.get(src_ip, ())) or 1,
         )
 
         flow_records.append(flow_record)

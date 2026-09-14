@@ -55,6 +55,21 @@ def load_fixture_flows(cls: str) -> list[FlowRecord]:
     return flows
 
 
+
+def _sample_across_variants(flows: list, target_count: int) -> list:
+    """Sample evenly across all YAML variants rather than taking the head.
+
+    See train_models._sample_across_variants -- slicing the head drew the whole
+    set from the first variant only.
+    """
+    if not flows or target_count <= 0:
+        return []
+    if len(flows) <= target_count:
+        return flows
+    step = len(flows) / float(target_count)
+    return [flows[int(i * step)] for i in range(target_count)]
+
+
 def generate_synthetic_flows(cls: str, target: int = 150) -> list[FlowRecord]:
     config_map = {
         "volumetric_ddos": "ddos.yaml",
@@ -72,7 +87,8 @@ def generate_synthetic_flows(cls: str, target: int = 150) -> list[FlowRecord]:
     try:
         from igu_sentinel.traffic_gen.runner import run_traffic_gen
         labeled = run_traffic_gen(str(config_path))
-        return [item["flow"] for item in labeled if item["threat_class"] == cls][:target]
+        flows = [item["flow"] for item in labeled if item["threat_class"] == cls]
+        return _sample_across_variants(flows, target)
     except Exception:
         return []
 

@@ -32,6 +32,9 @@ def generate(
     base_time = datetime.now()
 
     for i in range(num_flows):
+        # Packet-size spread defaults; volumetric_ddos widens these below.
+        pkt_std_factor = 0.2
+        pkt_min = pkt_max = None
         flow_id = f"{threat_class}_{source_mode}_{i}"
 
         # Generate characteristics based on threat class
@@ -40,8 +43,14 @@ def generate(
             inter_arrival_mean = 1.0 / rate if rate > 0 else 0.1  # Very fast
             packet_size_mean = size or 64
             entropy = 3.5
-            byte_ratio = 0.6
-            fanout = None
+            byte_ratio = 0.85  # flood pushes payload bytes hard
+            # A flood concentrates on ONE target: huge volume, no fan-out.
+            fanout = 1
+            ia_std_factor = 0.05  # metronomic / machine-generated flood
+            # Real floods mix tiny SYNs with MTU-sized payloads, so the size
+            # spread is wide -- not the narrow band the generator used to emit.
+            pkt_std_factor = 0.75
+            pkt_min, pkt_max = 40, 1500
             dns_entropy = None
             beacon_interval = None
             ja4 = None
@@ -52,7 +61,8 @@ def generate(
             packet_size_mean = size or 128
             entropy = 5.5
             byte_ratio = 0.5
-            fanout = None
+            fanout = 1  # beacon talks to one C2 endpoint
+            ia_std_factor = 0.05  # highly regular callback
             dns_entropy = None
             beacon_interval = {"mean": 10.0, "std": 0.5}  # Regular beacon
             ja4 = "t13d1618h0_002f,00-02-01_1301-1302-1303-1201-1200_000b-000a-0009-0008_0016,_45,1"
@@ -61,10 +71,22 @@ def generate(
             # DNS traffic with high entropy
             inter_arrival_mean = 1.0 / rate if rate > 0 else 0.2
             packet_size_mean = size or 100
-            entropy = 7.8  # High entropy for DNS names
-            byte_ratio = 0.4
-            fanout = 20  # Multiple DNS queries
-            dns_entropy = 7.9  # High DNS name entropy
+            # DNS tunnelling shows up in TWO shapes, and the model must know both:
+            #  * plain UDP DNS queries - tshark parses these into a `dns` layer, so
+            #    ingest extracts NO raw payload and reports entropy/byte_ratio ~0
+            #    (measured on a real DGA capture: entropy 0.00, byte_ratio 0.00);
+            #  * payload-bearing tunnels (iodine-style) that do carry raw bytes.
+            # Either way the identifying signal is dns_ngram_entropy, not entropy.
+            if i % 2:
+                entropy = 0.0          # raw DNS query, no extractable payload
+                byte_ratio = 0.02
+            else:
+                entropy = 7.8          # payload-bearing tunnel
+                byte_ratio = 0.4
+            fanout = 1  # one resolver: many QUERY NAMES, not many targets
+            ia_std_factor = 0.3
+            # Measured through real ingest: DGA/tunnelling names land 7.4-8.5.
+            dns_entropy = 7.5 + (i % 5) * 0.25
             beacon_interval = None
             ja4 = None
 
@@ -74,7 +96,8 @@ def generate(
             packet_size_mean = size or 256
             entropy = 7.2
             byte_ratio = 0.7
-            fanout = None
+            fanout = 1  # single TLS callback endpoint
+            ia_std_factor = 0.2
             dns_entropy = None
             beacon_interval = None
             # Malware TLS fingerprint: no SNI ('i'), no ALPN ('00')
@@ -85,8 +108,11 @@ def generate(
             inter_arrival_mean = 1.0 / rate if rate > 0 else 0.05  # Fast scanning
             packet_size_mean = size or 100
             entropy = 4.0
-            byte_ratio = 0.3
-            fanout = 50  # Many connection attempts
+            byte_ratio = 0.15  # probes carry almost no payload
+            # Scanning's defining signature: one source, MANY distinct targets.
+            # Spread across configs so the model learns "high fan-out", not one value.
+            fanout = max(40, int(rate) * 2)
+            ia_std_factor = 0.15
             dns_entropy = None
             beacon_interval = None
             ja4 = None
@@ -96,8 +122,9 @@ def generate(
             inter_arrival_mean = 1.0 / rate if rate > 0 else 0.1
             packet_size_mean = size or 512
             entropy = 6.5
-            byte_ratio = 0.9  # High byte ratio for data
-            fanout = None
+            byte_ratio = 0.97  # bulk outbound transfer
+            fanout = 1  # one exfil destination
+            ia_std_factor = 0.1
             dns_entropy = None
             beacon_interval = None
             ja4 = None
@@ -107,7 +134,8 @@ def generate(
             packet_size_mean = size or 128
             entropy = 5.0
             byte_ratio = 0.5
-            fanout = None
+            fanout = 1
+            ia_std_factor = 0.8  # human/app traffic arrives in bursts, not evenly
             dns_entropy = None
             beacon_interval = None
             ja4 = None
@@ -120,14 +148,16 @@ def generate(
             dst_port=port,
             protocol="TCP",
             packet_size_stats={
-                "min": max(40, int(packet_size_mean * 0.5)),
-                "max": int(packet_size_mean * 1.5),
+                "min": float(pkt_min if pkt_min is not None else max(40, int(packet_size_mean * 0.5))),
+                "max": float(pkt_max if pkt_max is not None else int(packet_size_mean * 1.5)),
                 "mean": float(packet_size_mean),
-                "std": float(packet_size_mean * 0.2),
+                "std": float(packet_size_mean * pkt_std_factor),
             },
             inter_arrival_stats={
                 "mean": inter_arrival_mean,
-                "std": inter_arrival_mean * 0.1,
+                # Timing regularity separates machine-generated floods/beacons
+                # (near-zero jitter) from bursty human/background traffic.
+                "std": inter_arrival_mean * ia_std_factor,
             },
             entropy=entropy,
             byte_ratio=byte_ratio,

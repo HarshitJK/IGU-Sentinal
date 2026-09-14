@@ -19,12 +19,12 @@ from typing import List, Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-from igu_sentinel.schemas import FlowRecord, Alert
+from igu_sentinel.schemas import FlowRecord, Alert, LayerScore
 from igu_sentinel.detect.rules import detect_rules
 from igu_sentinel.detect.stats import train_stats_baseline, detect_stats
 from igu_sentinel.detect.isoforest import score_isoforest   # loaded at import
 from igu_sentinel.detect.xgb import predict_xgb             # loaded at import
-from igu_sentinel.fusion import fuse_layers
+from igu_sentinel.fusion import fuse_layers, is_actionable_alert
 from igu_sentinel.alert import log_alert
 from igu_sentinel.ingest import (
     extract_flows_from_interface,
@@ -98,6 +98,8 @@ class CaptureController:
             "window_ms": None,
             "windows_processed": 0,
             "alerts_emitted": 0,
+            "alerts_suppressed": 0,
+            "flows_scored": 0,
             "error": None,
             "started_at": None,
         }
@@ -121,6 +123,8 @@ class CaptureController:
                 "window_ms": window_ms,
                 "windows_processed": 0,
                 "alerts_emitted": 0,
+                "alerts_suppressed": 0,
+                "flows_scored": 0,
                 "error": None,
                 "started_at": datetime.now().isoformat(),
             }
@@ -150,8 +154,15 @@ class CaptureController:
                 if not window_flows:
                     continue
                 # Same pipeline as POST /detect: rules+stats+isoforest+xgb -> fusion.
-                alerts = run_detection_pipeline(window_flows)
-                for alert in alerts:
+                scored = run_detection_pipeline_scored(window_flows)
+                self.state["flows_scored"] += len(scored)
+                for scores, alert in scored:
+                    # Only surface alerts the layers actually stand behind.
+                    # Without this every observed flow — including idle
+                    # background chatter — became an alert.
+                    if not is_actionable_alert(scores, alert):
+                        self.state["alerts_suppressed"] += 1
+                        continue
                     log_alert(alert)
                     self.state["alerts_emitted"] += 1
                     # Broadcast on the main event loop where the WS clients live.
@@ -220,32 +231,51 @@ def _ensure_stats_baseline() -> None:
 
 # ── Concurrent Detection Pipeline ─────────────────────────────────────────────
 
-async def detect_flow_async(flow: FlowRecord) -> Alert:
-    """Run all 4 detection layers concurrently on a single FlowRecord.
+async def detect_flow_scored_async(flow: FlowRecord) -> tuple[List[LayerScore], Alert]:
+    """Run all 4 detection layers concurrently, returning the scores AND the alert.
+
+    The per-layer scores are returned alongside the fused Alert because the
+    emission gate (fusion.is_actionable_alert) needs to know whether any layer
+    actually named a threat class — an Alert alone cannot express "benign".
 
     CPU-bound scoring functions (sklearn IsolationForest, XGBoost) are executed
     in worker threads via asyncio.to_thread() to avoid blocking the asyncio event loop.
     """
-    scores = await asyncio.gather(
+    scores = list(await asyncio.gather(
         asyncio.to_thread(detect_rules, flow),
         asyncio.to_thread(detect_stats, flow),
         asyncio.to_thread(score_isoforest, flow),
         asyncio.to_thread(predict_xgb, flow),
-    )
-    return fuse_layers(list(scores))
+    ))
+    return scores, fuse_layers(scores)
+
+
+async def detect_flow_async(flow: FlowRecord) -> Alert:
+    """Run all 4 detection layers concurrently on a single FlowRecord."""
+    _scores, alert = await detect_flow_scored_async(flow)
+    return alert
+
+
+async def run_detection_pipeline_scored_async(
+    flows: List[FlowRecord],
+) -> List[tuple[List[LayerScore], Alert]]:
+    """Run the pipeline concurrently, keeping each flow's LayerScores."""
+    if not flows:
+        return []
+    _ensure_stats_baseline()
+    tasks = [detect_flow_scored_async(f) for f in flows]
+    return list(await asyncio.gather(*tasks))
 
 
 async def run_detection_pipeline_async(flows: List[FlowRecord]) -> List[Alert]:
     """Run the detection pipeline concurrently over a batch of FlowRecords."""
-    if not flows:
-        return []
-    _ensure_stats_baseline()
-    tasks = [detect_flow_async(f) for f in flows]
-    return list(await asyncio.gather(*tasks))
+    return [alert for _scores, alert in await run_detection_pipeline_scored_async(flows)]
 
 
-def run_detection_pipeline(flows: List[FlowRecord]) -> List[Alert]:
-    """Synchronous pipeline entry point (used by tests, scripts, benchmarks).
+def run_detection_pipeline_scored(
+    flows: List[FlowRecord],
+) -> List[tuple[List[LayerScore], Alert]]:
+    """Synchronous pipeline entry point keeping each flow's LayerScores.
 
     Dispatches detection layers concurrently using ThreadPoolExecutor if an event
     loop is already running, or via asyncio.run() otherwise.
@@ -263,17 +293,27 @@ def run_detection_pipeline(flows: List[FlowRecord]) -> List[Alert]:
     if loop and loop.is_running():
         # Inside existing event loop: run layers concurrently across threads
         with ThreadPoolExecutor(max_workers=min(32, (len(flows) * 4) or 1)) as executor:
-            alerts: List[Alert] = []
+            results: List[tuple[List[LayerScore], Alert]] = []
             for flow in flows:
                 f_rules = executor.submit(detect_rules, flow)
                 f_stats = executor.submit(detect_stats, flow)
                 f_iso = executor.submit(score_isoforest, flow)
                 f_xgb = executor.submit(predict_xgb, flow)
                 scores = [f_rules.result(), f_stats.result(), f_iso.result(), f_xgb.result()]
-                alerts.append(fuse_layers(scores))
-            return alerts
+                results.append((scores, fuse_layers(scores)))
+            return results
     else:
-        return asyncio.run(run_detection_pipeline_async(flows))
+        return asyncio.run(run_detection_pipeline_scored_async(flows))
+
+
+def run_detection_pipeline(flows: List[FlowRecord]) -> List[Alert]:
+    """Synchronous pipeline entry point (used by tests, scripts, benchmarks).
+
+    Returns one Alert per input flow — scoring every flow is the contract here.
+    Whether an alert is worth surfacing is a separate decision made by
+    fusion.is_actionable_alert() at the emission points.
+    """
+    return [alert for _scores, alert in run_detection_pipeline_scored(flows)]
 
 
 # ── FastAPI Endpoints ─────────────────────────────────────────────────────────
@@ -312,10 +352,15 @@ async def detect(flows: list[dict]) -> list[dict]:
         List of Alert dicts.
     """
     flow_records = [FlowRecord(**f) for f in flows]
-    alerts = await run_detection_pipeline_async(flow_records)
+    scored = await run_detection_pipeline_scored_async(flow_records)
+    alerts = [alert for _s, alert in scored]
 
-    # Hash-chained logging and WebSocket real-time broadcast
-    for a in alerts:
+    # Hash-chained logging and WebSocket real-time broadcast happen only for
+    # alerts the detection layers actually stand behind. The response still
+    # carries a scored verdict for every submitted flow.
+    for layer_scores, a in scored:
+        if not is_actionable_alert(layer_scores, a):
+            continue
         log_alert(a)
         await manager.broadcast_alert(a)
 

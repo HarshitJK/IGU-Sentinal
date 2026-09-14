@@ -2,9 +2,9 @@
 IGU SENTINEL — MODEL EVALUATION REPORT
 ======================================================================
 
-Train set: 930 flows
-Test  set: 112 flows
-  benign                   : train=  75  test=  75
+Train set: 1155 flows
+Test  set: 337 flows
+  benign                   : train= 300  test= 300
   volumetric_ddos          : train= 150  test=   8
   c2_beaconing             : train= 105  test=   6
   dga_dns_tunneling        : train= 150  test=   5
@@ -20,51 +20,51 @@ ISOLATION FOREST — Binary Anomaly Detection
   (benign = score < 0.5; anomalous = score >= 0.5)
 ──────────────────────────────────────────────────────────────────────
 
-Accuracy          : 0.8393
-Macro Precision   : 0.8355
-Macro Recall      : 0.7910
-Macro F1          : 0.8067
+Accuracy          : 0.9318
+Macro Precision   : 0.8141
+Macro Recall      : 0.8787
+Macro F1          : 0.8420
 
 Per-class:
-  benign        P=0.843  R=0.933  F1=0.886  support=75
-  anomalous     P=0.828  R=0.649  F1=0.727  support=37
+  benign        P=0.976  R=0.947  F1=0.961  support=300
+  anomalous     P=0.652  R=0.811  F1=0.723  support=37
 
 Confusion matrix (rows=true, cols=pred):
              benign  anomalou
 -----------------------------
-benign           70         5
-anomalous        13        24
+benign          284        16
+anomalous         7        30
 
 ──────────────────────────────────────────────────────────────────────
 XGBOOST — Multi-class Threat Classification (7 classes)
 ──────────────────────────────────────────────────────────────────────
 
-Accuracy          : 0.8929
-Macro Precision   : 0.7726
-Macro Recall      : 0.7333
-Macro F1          : 0.7107
+Accuracy          : 0.9970
+Macro Precision   : 0.9995
+Macro Recall      : 0.9714
+Macro F1          : 0.9839
 
 Per-class breakdown:
   Class                      Precision  Recall      F1  Support
   -------------------------  ---------  ------  ------  -------
-  benign                         0.987   1.000   0.993       75
-  volumetric_ddos                0.421   1.000   0.593        8
+  benign                         0.997   1.000   0.998      300
+  volumetric_ddos                1.000   1.000   1.000        8
   c2_beaconing                   1.000   1.000   1.000        6
   dga_dns_tunneling              1.000   0.800   0.889        5
   encrypted_malware              1.000   1.000   1.000        5
-  recon_scanning                 0.000   0.000   0.000        7
-  data_exfiltration              1.000   0.333   0.500        6
+  recon_scanning                 1.000   1.000   1.000        7
+  data_exfiltration              1.000   1.000   1.000        6
 
 Confusion matrix (rows=true, cols=pred):
                      benign  volumetr  c2_beaco  dga_dns_  encrypte  recon_sc  data_exf
 ---------------------------------------------------------------------------------------
-benign                   75         0         0         0         0         0         0
+benign                  300         0         0         0         0         0         0
 volumetric_ddos           0         8         0         0         0         0         0
 c2_beaconing              0         0         6         0         0         0         0
 dga_dns_tunneling         1         0         0         4         0         0         0
 encrypted_malware         0         0         0         0         5         0         0
-recon_scanning            0         7         0         0         0         0         0
-data_exfiltration         0         4         0         0         0         0         2
+recon_scanning            0         0         0         0         0         7         0
+data_exfiltration         0         0         0         0         0         0         6
 
 ──────────────────────────────────────────────────────────────────────
 CAVEATS & RISKS

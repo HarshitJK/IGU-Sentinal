@@ -53,6 +53,25 @@ def load_fixture_flows(threat_class: str) -> list[FlowRecord]:
     return flows
 
 
+
+def _sample_across_variants(flows: list, target_count: int) -> list:
+    """Sample evenly across the whole generated list instead of taking the head.
+
+    run_traffic_gen() emits each YAML variant's flows in order, and the first
+    variant alone can produce thousands of flows. Slicing flows[:target_count]
+    therefore drew the ENTIRE training set from variant #1 - so the model only
+    ever saw one rate/size/port combination per threat class, which is exactly
+    the tool-fingerprint overfitting CLAUDE.md warns against. Striding samples
+    every variant.
+    """
+    if not flows or target_count <= 0:
+        return []
+    if len(flows) <= target_count:
+        return flows
+    step = len(flows) / float(target_count)
+    return [flows[int(i * step)] for i in range(target_count)]
+
+
 def generate_synthetic_flows(
     threat_class: str, target_count: int = 150
 ) -> list[FlowRecord]:
@@ -85,7 +104,7 @@ def generate_synthetic_flows(
         labeled = run_traffic_gen(str(config_path))
         # runner returns [{threat_class: str, flow: FlowRecord}, ...]
         flows = [item["flow"] for item in labeled if item["threat_class"] == threat_class]
-        return flows[:target_count]
+        return _sample_across_variants(flows, target_count)
     except Exception as exc:
         log.warning("traffic_gen failed for %s: %s", threat_class, exc)
         return []
