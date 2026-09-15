@@ -1,5 +1,12 @@
 """FastAPI app orchestrating the detection pipeline."""
-from fastapi import FastAPI
+import asyncio
+import json
+from datetime import datetime
+from collections import defaultdict
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from igu_sentinel.schemas import FlowRecord, Alert
 from igu_sentinel.detect.rules import detect_rules
 from igu_sentinel.detect.stats import train_stats_baseline, detect_stats
@@ -13,6 +20,57 @@ app = FastAPI(title="IGU Sentinel")
 # Global state for detectors
 _detectors_trained = False
 _training_flows = None
+
+# Global state for WebSocket broadcasting
+_alert_broadcast_clients = set()
+_alert_lock = asyncio.Lock()
+_alert_stats = {
+    "total_flows": 0,
+    "alert_history": [],
+    "threat_class_counts": defaultdict(int),
+    "last_alert_time": None,
+}
+
+
+async def broadcast_alert(alert: Alert):
+    """Broadcast an alert to all connected WebSocket clients."""
+    global _alert_broadcast_clients, _alert_stats
+
+    async with _alert_lock:
+        # Update stats
+        _alert_stats["total_flows"] += 1
+        _alert_stats["threat_class_counts"][alert.threat_class] += 1
+        _alert_stats["last_alert_time"] = datetime.now()
+
+        # Keep only last 100 alerts in history
+        _alert_stats["alert_history"].append(alert)
+        if len(_alert_stats["alert_history"]) > 100:
+            _alert_stats["alert_history"].pop(0)
+
+        # Prepare message
+        message = {
+            "type": "alert",
+            "timestamp": alert.timestamp.isoformat(),
+            "flow_id": alert.flow_id,
+            "threat_class": alert.threat_class,
+            "confidence_score": alert.confidence_score,
+            "evidence": alert.evidence,
+            "stats": {
+                "total_flows": _alert_stats["total_flows"],
+                "threat_class_counts": dict(_alert_stats["threat_class_counts"]),
+            }
+        }
+
+        # Broadcast to all connected clients
+        disconnected = set()
+        for client in _alert_broadcast_clients:
+            try:
+                await client.send_json(message)
+            except Exception:
+                disconnected.add(client)
+
+        # Clean up disconnected clients
+        _alert_broadcast_clients -= disconnected
 
 
 def run_detection_pipeline(flows: list[FlowRecord]) -> list[Alert]:
@@ -82,6 +140,10 @@ async def detect(flows: list[dict]) -> list[dict]:
     # Run pipeline
     alerts = run_detection_pipeline(flow_records)
 
+    # Broadcast each alert to WebSocket clients
+    for alert in alerts:
+        await broadcast_alert(alert)
+
     # Convert Alerts back to dicts
     return [
         {
@@ -93,3 +155,42 @@ async def detect(flows: list[dict]) -> list[dict]:
         }
         for a in alerts
     ]
+
+
+@app.websocket("/ws/alerts")
+async def websocket_alerts(websocket: WebSocket):
+    """WebSocket endpoint for live alert streaming."""
+    await websocket.accept()
+    _alert_broadcast_clients.add(websocket)
+
+    try:
+        # Send initial state
+        async with _alert_lock:
+            initial_state = {
+                "type": "init",
+                "total_flows": _alert_stats["total_flows"],
+                "threat_class_counts": dict(_alert_stats["threat_class_counts"]),
+                "alert_history": [
+                    {
+                        "timestamp": a.timestamp.isoformat(),
+                        "flow_id": a.flow_id,
+                        "threat_class": a.threat_class,
+                        "confidence_score": a.confidence_score,
+                    }
+                    for a in _alert_stats["alert_history"]
+                ]
+            }
+        await websocket.send_json(initial_state)
+
+        # Keep connection open
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        _alert_broadcast_clients.discard(websocket)
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """Serve the live demo dashboard HTML."""
+    dashboard_file = Path(__file__).parent / "dashboard.html"
+    return FileResponse(dashboard_file, media_type="text/html")

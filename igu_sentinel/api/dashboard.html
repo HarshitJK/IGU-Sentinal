@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IGU Sentinel — Live Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0a0e27;
+            color: #00ff41;
+            overflow: hidden;
+            height: 100vh;
+        }
+
+        .container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            padding: 20px;
+            gap: 20px;
+        }
+
+        header {
+            text-align: center;
+            border-bottom: 2px solid #00ff41;
+            padding-bottom: 15px;
+        }
+
+        header h1 {
+            font-size: 28px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+        }
+
+        header p {
+            font-size: 12px;
+            color: #00ff41aa;
+            margin-top: 5px;
+        }
+
+        .status {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #00ff41;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            flex: 1;
+            min-height: 0;
+        }
+
+        .panel {
+            border: 2px solid #00ff41;
+            background: rgba(0, 255, 65, 0.03);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .panel-title {
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 15px;
+            color: #00ff41;
+            border-bottom: 1px solid #00ff4155;
+            padding-bottom: 10px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .stat-box {
+            background: rgba(0, 255, 65, 0.1);
+            border: 1px solid #00ff4166;
+            padding: 15px;
+            text-align: center;
+        }
+
+        .stat-label {
+            font-size: 11px;
+            color: #00ff41aa;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #00ff41;
+            font-family: 'Monaco', monospace;
+        }
+
+        .rate-value {
+            font-size: 24px;
+            color: #00ff41;
+        }
+
+        .chart-container {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            min-height: 200px;
+        }
+
+        svg {
+            max-width: 100%;
+            max-height: 100%;
+        }
+
+        .threat-legend {
+            margin-top: 20px;
+            font-size: 11px;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+            padding: 4px;
+            border-left: 2px solid #00ff41;
+            padding-left: 8px;
+        }
+
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            margin-right: 8px;
+            border: 1px solid #00ff41;
+        }
+
+        .legend-text {
+            flex: 1;
+            color: #00ff41;
+        }
+
+        .legend-count {
+            color: #00ff41aa;
+            font-size: 10px;
+        }
+
+        .alerts-panel {
+            grid-column: 1 / -1;
+        }
+
+        .alerts-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .alerts-table thead {
+            position: sticky;
+            top: 0;
+            background: rgba(0, 255, 65, 0.1);
+            border-bottom: 1px solid #00ff4166;
+        }
+
+        .alerts-table th {
+            padding: 10px;
+            text-align: left;
+            color: #00ff41;
+            font-weight: bold;
+            text-transform: uppercase;
+            font-size: 10px;
+            letter-spacing: 0.5px;
+        }
+
+        .alerts-table td {
+            padding: 10px;
+            border-bottom: 1px solid #00ff4122;
+            color: #00ff41;
+        }
+
+        .alerts-table tbody tr:hover {
+            background: rgba(0, 255, 65, 0.05);
+        }
+
+        .threat-ddos { color: #ff0044; }
+        .threat-c2 { color: #ff6600; }
+        .threat-dga { color: #ffff00; }
+        .threat-malware { color: #ff44ff; }
+        .threat-recon { color: #00ffff; }
+        .threat-exfil { color: #ff4400; }
+
+        .confidence-high { color: #ff0044; }
+        .confidence-med { color: #ffff00; }
+        .confidence-low { color: #00ff41; }
+
+        .waiting {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex: 1;
+            color: #00ff41aa;
+            font-size: 14px;
+            text-align: center;
+        }
+
+        .waiting-text {
+            animation: blink 1s infinite;
+        }
+
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0.5; }
+        }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: rgba(0, 255, 65, 0.05);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #00ff4144;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #00ff4166;
+        }
+
+        @media (max-width: 1400px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1><span class="status"></span>IGU Sentinel Detection Dashboard</h1>
+            <p>Real-time passive threat detection • Unidirectional traffic analysis</p>
+        </header>
+
+        <div class="main-grid">
+            <!-- Total Flows & Rate Panel -->
+            <div class="panel">
+                <div class="panel-title">Scan Rate & Flow Count</div>
+                <div class="stats-grid">
+                    <div class="stat-box">
+                        <div class="stat-label">Total Flows</div>
+                        <div class="stat-value" id="totalFlows">0</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-label">Flows/sec</div>
+                        <div class="stat-value rate-value" id="flowRate">0.0</div>
+                    </div>
+                </div>
+                <div style="color: #00ff41aa; font-size: 11px; margin-top: auto;">
+                    <div>Last alert: <span id="lastAlertTime">—</span></div>
+                    <div>Connected: <span id="connectionStatus">Connecting...</span></div>
+                </div>
+            </div>
+
+            <!-- Threat Class Breakdown Panel -->
+            <div class="panel">
+                <div class="panel-title">Threat Class Distribution</div>
+                <div class="chart-container">
+                    <canvas id="threatChart" width="200" height="200"></canvas>
+                    <div class="waiting" id="waitingChart" style="display: none;">
+                        <div class="waiting-text">Awaiting alerts...</div>
+                    </div>
+                </div>
+                <div class="threat-legend" id="threatLegend"></div>
+            </div>
+
+            <!-- Recent Alerts Panel -->
+            <div class="panel alerts-panel">
+                <div class="panel-title">Recent Alerts</div>
+                <div style="flex: 1; overflow-y: auto;">
+                    <table class="alerts-table">
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>Flow ID</th>
+                                <th>Threat Class</th>
+                                <th>Confidence</th>
+                            </tr>
+                        </thead>
+                        <tbody id="alertsTable">
+                            <tr>
+                                <td colspan="4" style="text-align: center; color: #00ff41aa;">
+                                    No alerts yet — waiting for traffic
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const THREAT_CLASS_COLORS = {
+            'volumetric_ddos': '#ff0044',
+            'c2_beaconing': '#ff6600',
+            'dga_dns_tunneling': '#ffff00',
+            'encrypted_malware': '#ff44ff',
+            'recon_scanning': '#00ffff',
+            'data_exfiltration': '#ff4400',
+        };
+
+        const THREAT_CLASS_LABELS = {
+            'volumetric_ddos': 'Volumetric DDoS',
+            'c2_beaconing': 'C2 Beaconing',
+            'dga_dns_tunneling': 'DGA/DNS Tunneling',
+            'encrypted_malware': 'Encrypted Malware',
+            'recon_scanning': 'Recon Scanning',
+            'data_exfiltration': 'Data Exfiltration',
+        };
+
+        let state = {
+            totalFlows: 0,
+            threatCounts: {},
+            alertHistory: [],
+            startTime: Date.now(),
+            lastAlertTime: null,
+        };
+
+        let canvas = document.getElementById('threatChart');
+        let ctx = canvas.getContext('2d');
+
+        function getConfidenceClass(score) {
+            if (score >= 0.7) return 'confidence-high';
+            if (score >= 0.4) return 'confidence-med';
+            return 'confidence-low';
+        }
+
+        function getThreatClass(threatType) {
+            const mapping = {
+                'volumetric_ddos': 'threat-ddos',
+                'c2_beaconing': 'threat-c2',
+                'dga_dns_tunneling': 'threat-dga',
+                'encrypted_malware': 'threat-malware',
+                'recon_scanning': 'threat-recon',
+                'data_exfiltration': 'threat-exfil',
+            };
+            return mapping[threatType] || '';
+        }
+
+        function updateStats() {
+            document.getElementById('totalFlows').textContent = state.totalFlows.toLocaleString();
+
+            const elapsedSeconds = (Date.now() - state.startTime) / 1000;
+            const flowRate = elapsedSeconds > 0 ? state.totalFlows / elapsedSeconds : 0;
+            document.getElementById('flowRate').textContent = flowRate.toFixed(1);
+
+            if (state.lastAlertTime) {
+                const lastTime = new Date(state.lastAlertTime);
+                const now = new Date();
+                const diffSeconds = (now - lastTime) / 1000;
+
+                if (diffSeconds < 60) {
+                    document.getElementById('lastAlertTime').textContent = `${Math.round(diffSeconds)}s ago`;
+                } else {
+                    document.getElementById('lastAlertTime').textContent = lastTime.toLocaleTimeString();
+                }
+            }
+        }
+
+        function drawChart() {
+            const threatCounts = state.threatCounts;
+            const total = Object.values(threatCounts).reduce((a, b) => a + b, 0);
+
+            if (total === 0) {
+                document.getElementById('waitingChart').style.display = 'flex';
+                canvas.style.display = 'none';
+                return;
+            }
+
+            document.getElementById('waitingChart').style.display = 'none';
+            canvas.style.display = 'block';
+
+            canvas.width = 200;
+            canvas.height = 200;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Draw donut chart
+            const centerX = canvas.width / 2;
+            const centerY = canvas.height / 2;
+            const outerRadius = 70;
+            const innerRadius = 40;
+
+            let currentAngle = -Math.PI / 2;
+
+            const sortedClasses = Object.entries(threatCounts)
+                .sort((a, b) => b[1] - a[1]);
+
+            for (const [threatClass, count] of sortedClasses) {
+                const sliceAngle = (count / total) * 2 * Math.PI;
+
+                // Draw slice
+                ctx.fillStyle = THREAT_CLASS_COLORS[threatClass];
+                ctx.beginPath();
+                ctx.arc(centerX, centerY, outerRadius, currentAngle, currentAngle + sliceAngle);
+                ctx.lineTo(
+                    centerX + innerRadius * Math.cos(currentAngle + sliceAngle),
+                    centerY + innerRadius * Math.sin(currentAngle + sliceAngle)
+                );
+                ctx.arc(
+                    centerX,
+                    centerY,
+                    innerRadius,
+                    currentAngle + sliceAngle,
+                    currentAngle,
+                    true
+                );
+                ctx.closePath();
+                ctx.fill();
+
+                // Draw border
+                ctx.strokeStyle = THREAT_CLASS_COLORS[threatClass];
+                ctx.lineWidth = 1;
+                ctx.stroke();
+
+                currentAngle += sliceAngle;
+            }
+
+            // Draw legend
+            const legendHtml = sortedClasses
+                .map(([threatClass, count]) => `
+                    <div class="legend-item">
+                        <div class="legend-color" style="background: ${THREAT_CLASS_COLORS[threatClass]};"></div>
+                        <div class="legend-text">${THREAT_CLASS_LABELS[threatClass]}</div>
+                        <div class="legend-count">${count}</div>
+                    </div>
+                `)
+                .join('');
+
+            document.getElementById('threatLegend').innerHTML = legendHtml;
+        }
+
+        function addAlert(alert) {
+            state.alertHistory.unshift(alert);
+            if (state.alertHistory.length > 100) {
+                state.alertHistory.pop();
+            }
+
+            // Update threat counts
+            state.threatCounts[alert.threat_class] = (state.threatCounts[alert.threat_class] || 0) + 1;
+            state.totalFlows += 1;
+            state.lastAlertTime = alert.timestamp;
+
+            updateStats();
+            drawChart();
+            updateAlertsTable();
+        }
+
+        function updateAlertsTable() {
+            const tbody = document.getElementById('alertsTable');
+
+            if (state.alertHistory.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="4" style="text-align: center; color: #00ff41aa;">
+                            No alerts yet — waiting for traffic
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+
+            tbody.innerHTML = state.alertHistory
+                .map(alert => {
+                    const time = new Date(alert.timestamp).toLocaleTimeString();
+                    const threatClass = alert.threat_class;
+                    const confidence = (alert.confidence_score * 100).toFixed(0);
+
+                    return `
+                        <tr>
+                            <td>${time}</td>
+                            <td style="font-family: monospace; font-size: 10px;">${alert.flow_id.slice(-8)}</td>
+                            <td class="${getThreatClass(threatClass)}">${threatClass}</td>
+                            <td class="${getConfidenceClass(alert.confidence_score)}">${confidence}%</td>
+                        </tr>
+                    `;
+                })
+                .join('');
+        }
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws/alerts`;
+
+            const ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                document.getElementById('connectionStatus').textContent = '✓ Connected';
+                document.getElementById('connectionStatus').style.color = '#00ff41';
+            };
+
+            ws.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+
+                if (message.type === 'init') {
+                    // Initial state
+                    state.totalFlows = message.total_flows;
+                    state.threatCounts = message.threat_class_counts;
+                    state.alertHistory = message.alert_history.reverse();
+                    state.lastAlertTime = message.alert_history.length > 0
+                        ? message.alert_history[0].timestamp
+                        : null;
+                    updateStats();
+                    drawChart();
+                    updateAlertsTable();
+                } else if (message.type === 'alert') {
+                    // New alert
+                    addAlert({
+                        timestamp: message.timestamp,
+                        flow_id: message.flow_id,
+                        threat_class: message.threat_class,
+                        confidence_score: message.confidence_score,
+                    });
+                }
+            };
+
+            ws.onerror = () => {
+                document.getElementById('connectionStatus').textContent = '✗ Error';
+                document.getElementById('connectionStatus').style.color = '#ff0044';
+            };
+
+            ws.onclose = () => {
+                document.getElementById('connectionStatus').textContent = '✗ Disconnected';
+                document.getElementById('connectionStatus').style.color = '#ff0044';
+                // Attempt to reconnect after 2 seconds
+                setTimeout(connectWebSocket, 2000);
+            };
+        }
+
+        // Start the dashboard
+        connectWebSocket();
+        updateStats();
+        drawChart();
+
+        // Update stats every 500ms
+        setInterval(updateStats, 500);
+    </script>
+</body>
+</html>
