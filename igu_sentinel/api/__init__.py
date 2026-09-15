@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from igu_sentinel.schemas import FlowRecord, Alert, LayerScore
 from igu_sentinel.detect.rules import detect_rules
 from igu_sentinel.detect.stats import train_stats_baseline, detect_stats
@@ -441,3 +441,11 @@ async def capture_stop():
 async def capture_status():
     """Return the current live-capture status and counters."""
     return capture.snapshot()
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """Serve the live demo dashboard HTML."""
+    dashboard_file = Path(__file__).parent / "dashboard.html"
+    return FileResponse(dashboard_file, media_type="text/html")
+
