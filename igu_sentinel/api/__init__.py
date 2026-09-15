@@ -1,122 +1,322 @@
-"""FastAPI app orchestrating the detection pipeline."""
+"""FastAPI app orchestrating the detection pipeline with concurrent layer execution and WebSocket streaming.
+
+Pipeline Architecture:
+  - Detection layers (rules, stats, isoforest, xgb) run CONCURRENTLY per flow via asyncio.gather()
+    and asyncio.to_thread() to offload CPU-bound ML scoring without blocking the event loop.
+  - Fusion correlates LayerScores into an Alert with confidence scoring.
+  - Alert logging applies SHA-256 hash chaining.
+  - Real-time streaming broadcasts alerts over WebSocket at /ws/alerts to connected dashboards.
+"""
 import asyncio
 import json
+import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from collections import defaultdict
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-from igu_sentinel.schemas import FlowRecord, Alert
+from typing import List, Optional, Set
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+from igu_sentinel.schemas import FlowRecord, Alert, LayerScore
 from igu_sentinel.detect.rules import detect_rules
 from igu_sentinel.detect.stats import train_stats_baseline, detect_stats
-from igu_sentinel.detect.isoforest import train_isoforest, score_isoforest
-from igu_sentinel.detect.xgb import train_xgb, predict_xgb
-from igu_sentinel.fusion import fuse_layers
+from igu_sentinel.detect.isoforest import score_isoforest   # loaded at import
+from igu_sentinel.detect.xgb import predict_xgb             # loaded at import
+from igu_sentinel.fusion import fuse_layers, is_actionable_alert
+from igu_sentinel.alert import log_alert
+from igu_sentinel.ingest import (
+    extract_flows_from_interface,
+    LiveCaptureError,
+    DEFAULT_WINDOW_MS,
+)
 
+log = logging.getLogger(__name__)
+app = FastAPI(title="IGU Sentinel", description="Passive Diode-Fed Threat Detection System")
 
-app = FastAPI(title="IGU Sentinel")
+# ── WebSocket connection manager ──────────────────────────────────────────────
+class ConnectionManager:
+    """Manages active WebSocket connections for streaming real-time alerts."""
 
-# Global state for detectors
-_detectors_trained = False
-_training_flows = None
+    def __init__(self):
+        self.active_connections: Set[WebSocket] = set()
 
-# Global state for WebSocket broadcasting
-_alert_broadcast_clients = set()
-_alert_lock = asyncio.Lock()
-_alert_stats = {
-    "total_flows": 0,
-    "alert_history": [],
-    "threat_class_counts": defaultdict(int),
-    "last_alert_time": None,
-}
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.add(websocket)
+        log.info("WebSocket client connected. Active: %d", len(self.active_connections))
 
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.discard(websocket)
+        log.info("WebSocket client disconnected. Active: %d", len(self.active_connections))
 
-async def broadcast_alert(alert: Alert):
-    """Broadcast an alert to all connected WebSocket clients."""
-    global _alert_broadcast_clients, _alert_stats
+    async def broadcast_alert(self, alert: Alert):
+        """Broadcast an Alert as JSON to all active WebSocket connections."""
+        if not self.active_connections:
+            return
 
-    async with _alert_lock:
-        # Update stats
-        _alert_stats["total_flows"] += 1
-        _alert_stats["threat_class_counts"][alert.threat_class] += 1
-        _alert_stats["last_alert_time"] = datetime.now()
-
-        # Keep only last 100 alerts in history
-        _alert_stats["alert_history"].append(alert)
-        if len(_alert_stats["alert_history"]) > 100:
-            _alert_stats["alert_history"].pop(0)
-
-        # Prepare message
-        message = {
-            "type": "alert",
+        payload = {
             "timestamp": alert.timestamp.isoformat(),
             "flow_id": alert.flow_id,
             "threat_class": alert.threat_class,
             "confidence_score": alert.confidence_score,
             "evidence": alert.evidence,
-            "stats": {
-                "total_flows": _alert_stats["total_flows"],
-                "threat_class_counts": dict(_alert_stats["threat_class_counts"]),
-            }
         }
 
-        # Broadcast to all connected clients
-        disconnected = set()
-        for client in _alert_broadcast_clients:
+        dead_connections = set()
+        for connection in list(self.active_connections):
             try:
-                await client.send_json(message)
+                await connection.send_json(payload)
             except Exception:
-                disconnected.add(client)
+                dead_connections.add(connection)
 
-        # Clean up disconnected clients
-        _alert_broadcast_clients -= disconnected
+        for dead in dead_connections:
+            self.disconnect(dead)
 
 
-def run_detection_pipeline(flows: list[FlowRecord]) -> list[Alert]:
-    """Run the full detection pipeline on flows.
+manager = ConnectionManager()
 
-    Pipeline:
-    1. Extract features and run all detection layers (rules, stats, isoforest, xgb)
-    2. Fuse scores from all layers
-    3. Generate Alert with combined confidence
 
-    Args:
-        flows: List of FlowRecords to process
+# ── Live capture controller ───────────────────────────────────────────────────
+class CaptureController:
+    """Runs a live tshark capture in a background thread and feeds each fixed
+    window's flows through the SAME detection pipeline used by POST /detect,
+    hash-logging every alert and broadcasting it to the SAME /ws/alerts clients.
 
-    Returns:
-        List of Alert objects (one per flow)
+    The worker isolates all capture failures: a bad interface or missing capture
+    permission is recorded as an error state and never crashes the API process.
     """
-    global _detectors_trained, _training_flows
 
+    def __init__(self) -> None:
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event: Optional[threading.Event] = None
+        self._lock = threading.Lock()
+        self.state: dict = {
+            "status": "idle",          # idle | starting | running | stopped | error
+            "interface": None,
+            "window_ms": None,
+            "windows_processed": 0,
+            "alerts_emitted": 0,
+            "alerts_suppressed": 0,
+            "flows_scored": 0,
+            "error": None,
+            "started_at": None,
+        }
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def snapshot(self) -> dict:
+        s = dict(self.state)
+        s["running"] = self.is_running()
+        return s
+
+    def start(self, interface: str, window_ms: int, loop: asyncio.AbstractEventLoop) -> None:
+        with self._lock:
+            if self.is_running():
+                raise RuntimeError(f"capture already running on '{self.state.get('interface')}'")
+            self._stop_event = threading.Event()
+            self.state = {
+                "status": "starting",
+                "interface": interface,
+                "window_ms": window_ms,
+                "windows_processed": 0,
+                "alerts_emitted": 0,
+                "alerts_suppressed": 0,
+                "flows_scored": 0,
+                "error": None,
+                "started_at": datetime.now().isoformat(),
+            }
+            self._thread = threading.Thread(
+                target=self._worker,
+                args=(interface, window_ms, loop, self._stop_event),
+                name="live-capture",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _worker(
+        self,
+        interface: str,
+        window_ms: int,
+        loop: asyncio.AbstractEventLoop,
+        stop_event: threading.Event,
+    ) -> None:
+        try:
+            _ensure_stats_baseline()
+            for window_flows in extract_flows_from_interface(interface, window_ms, stop_event):
+                if stop_event.is_set():
+                    break
+                # First yielded window (even empty) confirms capture is live.
+                self.state["status"] = "running"
+                self.state["windows_processed"] += 1
+                if not window_flows:
+                    continue
+                # Same pipeline as POST /detect: rules+stats+isoforest+xgb -> fusion.
+                scored = run_detection_pipeline_scored(window_flows)
+                self.state["flows_scored"] += len(scored)
+                for scores, alert in scored:
+                    # Only surface alerts the layers actually stand behind.
+                    # Without this every observed flow — including idle
+                    # background chatter — became an alert.
+                    if not is_actionable_alert(scores, alert):
+                        self.state["alerts_suppressed"] += 1
+                        continue
+                    log_alert(alert)
+                    self.state["alerts_emitted"] += 1
+                    # Broadcast on the main event loop where the WS clients live.
+                    try:
+                        fut = asyncio.run_coroutine_threadsafe(
+                            manager.broadcast_alert(alert), loop
+                        )
+                        fut.result(timeout=5)
+                    except Exception:
+                        log.exception("live capture: alert broadcast failed")
+        except LiveCaptureError as exc:
+            self.state["status"] = "error"
+            self.state["error"] = str(exc)
+            log.warning("live capture error: %s", exc)
+            return
+        except Exception as exc:  # never let capture crash the service
+            self.state["status"] = "error"
+            self.state["error"] = f"{type(exc).__name__}: {exc}"
+            log.exception("live capture worker crashed")
+            return
+        if self.state.get("status") != "error":
+            self.state["status"] = "stopped"
+
+    def stop(self) -> None:
+        with self._lock:
+            if self._stop_event is not None:
+                self._stop_event.set()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=6)
+        if self.state.get("status") != "error":
+            self.state["status"] = "stopped"
+
+
+capture = CaptureController()
+
+
+# ── One-time startup state ────────────────────────────────────────────────────
+_stats_trained: bool = False
+
+
+def _ensure_stats_baseline() -> None:
+    """Train stats baseline from benign fixture once on first use."""
+    global _stats_trained
+    if _stats_trained:
+        return
+
+    fixtures_dir = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+    benign_file = fixtures_dir / "benign_sample.jsonl"
+    benign_flows: list[FlowRecord] = []
+    if benign_file.exists():
+        with open(benign_file) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    benign_flows.append(FlowRecord(**json.loads(line)))
+
+    if benign_flows:
+        train_stats_baseline(benign_flows)
+        log.info("stats baseline trained on %d benign flows", len(benign_flows))
+    else:
+        log.warning("benign fixture not found — stats baseline not trained")
+
+    _stats_trained = True
+
+
+# ── Concurrent Detection Pipeline ─────────────────────────────────────────────
+
+async def detect_flow_scored_async(flow: FlowRecord) -> tuple[List[LayerScore], Alert]:
+    """Run all 4 detection layers concurrently, returning the scores AND the alert.
+
+    The per-layer scores are returned alongside the fused Alert because the
+    emission gate (fusion.is_actionable_alert) needs to know whether any layer
+    actually named a threat class — an Alert alone cannot express "benign".
+
+    CPU-bound scoring functions (sklearn IsolationForest, XGBoost) are executed
+    in worker threads via asyncio.to_thread() to avoid blocking the asyncio event loop.
+    """
+    scores = list(await asyncio.gather(
+        asyncio.to_thread(detect_rules, flow),
+        asyncio.to_thread(detect_stats, flow),
+        asyncio.to_thread(score_isoforest, flow),
+        asyncio.to_thread(predict_xgb, flow),
+    ))
+    return scores, fuse_layers(scores)
+
+
+async def detect_flow_async(flow: FlowRecord) -> Alert:
+    """Run all 4 detection layers concurrently on a single FlowRecord."""
+    _scores, alert = await detect_flow_scored_async(flow)
+    return alert
+
+
+async def run_detection_pipeline_scored_async(
+    flows: List[FlowRecord],
+) -> List[tuple[List[LayerScore], Alert]]:
+    """Run the pipeline concurrently, keeping each flow's LayerScores."""
+    if not flows:
+        return []
+    _ensure_stats_baseline()
+    tasks = [detect_flow_scored_async(f) for f in flows]
+    return list(await asyncio.gather(*tasks))
+
+
+async def run_detection_pipeline_async(flows: List[FlowRecord]) -> List[Alert]:
+    """Run the detection pipeline concurrently over a batch of FlowRecords."""
+    return [alert for _scores, alert in await run_detection_pipeline_scored_async(flows)]
+
+
+def run_detection_pipeline_scored(
+    flows: List[FlowRecord],
+) -> List[tuple[List[LayerScore], Alert]]:
+    """Synchronous pipeline entry point keeping each flow's LayerScores.
+
+    Dispatches detection layers concurrently using ThreadPoolExecutor if an event
+    loop is already running, or via asyncio.run() otherwise.
+    """
     if not flows:
         return []
 
-    # Train detectors on first call (using all flows as if they're benign for baseline)
-    if not _detectors_trained:
-        _training_flows = flows
-        train_stats_baseline(flows)
-        train_isoforest(flows)
-        train_xgb(flows, ["benign"] * len(flows))  # Assume all training data is benign
-        _detectors_trained = True
+    _ensure_stats_baseline()
 
-    alerts = []
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
 
-    for flow in flows:
-        # Run all detection layers
-        scores = [
-            detect_rules(flow),
-            detect_stats(flow),
-            score_isoforest(flow),
-            predict_xgb(flow),
-        ]
+    if loop and loop.is_running():
+        # Inside existing event loop: run layers concurrently across threads
+        with ThreadPoolExecutor(max_workers=min(32, (len(flows) * 4) or 1)) as executor:
+            results: List[tuple[List[LayerScore], Alert]] = []
+            for flow in flows:
+                f_rules = executor.submit(detect_rules, flow)
+                f_stats = executor.submit(detect_stats, flow)
+                f_iso = executor.submit(score_isoforest, flow)
+                f_xgb = executor.submit(predict_xgb, flow)
+                scores = [f_rules.result(), f_stats.result(), f_iso.result(), f_xgb.result()]
+                results.append((scores, fuse_layers(scores)))
+            return results
+    else:
+        return asyncio.run(run_detection_pipeline_scored_async(flows))
 
-        # Fuse scores into alert
-        alert = fuse_layers(scores)
-        alerts.append(alert)
 
-    return alerts
+def run_detection_pipeline(flows: List[FlowRecord]) -> List[Alert]:
+    """Synchronous pipeline entry point (used by tests, scripts, benchmarks).
 
+    Returns one Alert per input flow — scoring every flow is the contract here.
+    Whether an alert is worth surfacing is a separate decision made by
+    fusion.is_actionable_alert() at the emission points.
+    """
+    return [alert for _scores, alert in run_detection_pipeline_scored(flows)]
+
+
+# ── FastAPI Endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health_check():
@@ -124,27 +324,46 @@ async def health_check():
     return {"status": "ok", "service": "IGU Sentinel"}
 
 
+@app.websocket("/ws/alerts")
+async def websocket_alerts(websocket: WebSocket):
+    """WebSocket endpoint streaming alerts in real-time as flows are processed."""
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection open; receive client pings/messages if any
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)
+
+
 @app.post("/detect")
 async def detect(flows: list[dict]) -> list[dict]:
     """Run detection pipeline on flows.
 
+    Layers are evaluated concurrently for each flow. Produced alerts are logged
+    with SHA-256 hash chaining and broadcast in real-time to all connected WebSocket clients.
+
     Args:
-        flows: List of flow dicts matching FlowRecord schema
+        flows: List of flow dicts matching FlowRecord schema.
 
     Returns:
-        List of Alert dicts
+        List of Alert dicts.
     """
-    # Convert dicts to FlowRecords
     flow_records = [FlowRecord(**f) for f in flows]
+    scored = await run_detection_pipeline_scored_async(flow_records)
+    alerts = [alert for _s, alert in scored]
 
-    # Run pipeline
-    alerts = run_detection_pipeline(flow_records)
+    # Hash-chained logging and WebSocket real-time broadcast happen only for
+    # alerts the detection layers actually stand behind. The response still
+    # carries a scored verdict for every submitted flow.
+    for layer_scores, a in scored:
+        if not is_actionable_alert(layer_scores, a):
+            continue
+        log_alert(a)
+        await manager.broadcast_alert(a)
 
-    # Broadcast each alert to WebSocket clients
-    for alert in alerts:
-        await broadcast_alert(alert)
-
-    # Convert Alerts back to dicts
     return [
         {
             "timestamp": a.timestamp.isoformat(),
@@ -157,40 +376,68 @@ async def detect(flows: list[dict]) -> list[dict]:
     ]
 
 
-@app.websocket("/ws/alerts")
-async def websocket_alerts(websocket: WebSocket):
-    """WebSocket endpoint for live alert streaming."""
-    await websocket.accept()
-    _alert_broadcast_clients.add(websocket)
+# ── Live capture control endpoints ────────────────────────────────────────────
 
+@app.post("/capture/start")
+async def capture_start(config: dict):
+    """Start continuous live capture on an interface.
+
+    Body: {"interface": "<name>", "window_ms": 120 (optional)}
+
+    Captured flows are batched per fixed window and pushed through the same
+    detect -> fusion -> alert -> /ws/alerts path as POST /detect. Returns a clear
+    error (HTTP 400) — without crashing the service — if the interface does not
+    exist or cannot be captured on (e.g. missing permission).
+    """
+    config = config or {}
+    interface = config.get("interface")
+    if not interface or not isinstance(interface, str):
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "'interface' (string) is required"},
+        )
     try:
-        # Send initial state
-        async with _alert_lock:
-            initial_state = {
-                "type": "init",
-                "total_flows": _alert_stats["total_flows"],
-                "threat_class_counts": dict(_alert_stats["threat_class_counts"]),
-                "alert_history": [
-                    {
-                        "timestamp": a.timestamp.isoformat(),
-                        "flow_id": a.flow_id,
-                        "threat_class": a.threat_class,
-                        "confidence_score": a.confidence_score,
-                    }
-                    for a in _alert_stats["alert_history"]
-                ]
-            }
-        await websocket.send_json(initial_state)
+        window_ms = int(config.get("window_ms", DEFAULT_WINDOW_MS))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "'window_ms' must be an integer"},
+        )
+    if window_ms <= 0:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "'window_ms' must be positive"},
+        )
 
-        # Keep connection open
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        _alert_broadcast_clients.discard(websocket)
+    loop = asyncio.get_running_loop()
+    try:
+        capture.start(interface, window_ms, loop)
+    except RuntimeError as exc:
+        return JSONResponse(status_code=409, content={**capture.snapshot(), "error": str(exc)})
+
+    # Wait briefly for the worker to confirm it is live or report a startup error,
+    # so the caller gets a definitive answer (interface valid / permission ok).
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if capture.state.get("status") in ("running", "error"):
+            break
+        await asyncio.sleep(0.05)
+
+    if capture.state.get("status") == "error":
+        return JSONResponse(status_code=400, content=capture.snapshot())
+    return capture.snapshot()
 
 
-@app.get("/dashboard")
-async def dashboard():
-    """Serve the live demo dashboard HTML."""
-    dashboard_file = Path(__file__).parent / "dashboard.html"
-    return FileResponse(dashboard_file, media_type="text/html")
+@app.post("/capture/stop")
+async def capture_stop():
+    """Stop the active live capture (idempotent)."""
+    if not capture.is_running():
+        return {**capture.snapshot(), "detail": "no active capture"}
+    await asyncio.to_thread(capture.stop)
+    return capture.snapshot()
+
+
+@app.get("/capture/status")
+async def capture_status():
+    """Return the current live-capture status and counters."""
+    return capture.snapshot()

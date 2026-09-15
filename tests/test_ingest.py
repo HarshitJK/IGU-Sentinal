@@ -329,3 +329,52 @@ def test_tshark_available():
         print(f"✓ tshark available: {result.stdout.split()[0:2]}")
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         raise AssertionError(f"tshark not available: {e}")
+
+
+def test_extract_ja4_from_pcap_tls(tmp_path):
+    """Verify real JA4 fingerprint extraction from TLS Client Hello in pcap."""
+    pcap_path = tmp_path / "tls_handshake.pcap"
+
+    # Build TLS Client Hello packet
+    eth = bytes.fromhex("ffffffffffffaabbccddeeff0800")
+    ciphers = bytes.fromhex("130113021303c02bc02f")
+    cipher_len = struct.pack(">H", len(ciphers))
+    sni_host = b"secure-banking.example.com"
+    sni_ext_data = struct.pack(">H", len(sni_host) + 3) + b"\x00" + struct.pack(">H", len(sni_host)) + sni_host
+    sni_ext = struct.pack(">HH", 0x0000, len(sni_ext_data)) + sni_ext_data
+    alpn_val = b"\x02h2\x08http/1.1"
+    alpn_ext_data = struct.pack(">H", len(alpn_val)) + alpn_val
+    alpn_ext = struct.pack(">HH", 0x0010, len(alpn_ext_data)) + alpn_ext_data
+    sup_ver_data = struct.pack(">B", 4) + bytes.fromhex("03040303")
+    sup_ver_ext = struct.pack(">HH", 0x002b, len(sup_ver_data)) + sup_ver_data
+    extensions = sni_ext + alpn_ext + sup_ver_ext
+    ext_len = struct.pack(">H", len(extensions))
+    client_hello_body = (
+        struct.pack(">H", 0x0303) +
+        b"\x00" * 32 +
+        b"\x00" +
+        cipher_len + ciphers +
+        b"\x01\x00" +
+        ext_len + extensions
+    )
+    handshake_msg = b"\x01" + struct.pack(">I", len(client_hello_body))[1:] + client_hello_body
+    tls_record = b"\x16\x03\x01" + struct.pack(">H", len(handshake_msg)) + handshake_msg
+    tcp = struct.pack(">HHIIBBHHH", 50000, 443, 1000, 0, (5 << 4), 0x18, 8192, 0, 0) + tls_record
+    src_ip = bytes([192, 168, 1, 100])
+    dst_ip = bytes([192, 168, 1, 1])
+    ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(tcp), 1, 0, 64, 6, 0, src_ip, dst_ip)
+    pkt = eth + ip + tcp
+
+    with open(pcap_path, "wb") as f:
+        f.write(struct.pack("<IHHIIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
+        f.write(struct.pack("<IIII", 1700000000, 0, len(pkt), len(pkt)))
+        f.write(pkt)
+
+    flows = extract_flows_from_pcap(str(pcap_path))
+    assert len(flows) == 1
+    tls_flow = flows[0]
+    assert tls_flow.dst_port == 443
+    assert tls_flow.ja4 is not None, "JA4 should be extracted for TLS Client Hello"
+    assert len(tls_flow.ja4) == 36
+    assert tls_flow.ja4.startswith("t13d0501h2_")
+    print(f"✓ Successfully extracted JA4: {tls_flow.ja4}")

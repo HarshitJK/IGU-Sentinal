@@ -117,3 +117,25 @@ def test_rules_unusual_ports():
     # High entropy + unusual port should raise suspicion
     assert score.calibrated_probability > 0.3
     print("✓ test_rules_unusual_ports passed")
+
+
+def test_rules_detect_encrypted_malware_ja4():
+    """Rules detector should flag flows bearing malicious JA4 fingerprints."""
+    malware_flow = FlowRecord(
+        flow_id="malware_tls_ja4",
+        timestamp="2026-09-12T14:00:00",
+        src_port=49876,
+        dst_port=443,
+        protocol="TCP",
+        packet_size_stats={"min": 100, "max": 1500, "mean": 700, "std": 400},
+        inter_arrival_stats={"mean": 0.05, "std": 0.03},
+        entropy=7.9,
+        byte_ratio=0.85,
+        ttl=64,
+        ja4="t13i050200_e133e205ac38_000000000000",  # No SNI, no ALPN malware profile
+    )
+    score = detect_rules(malware_flow)
+    assert score.calibrated_probability > 0.6
+    assert score.threat_class_guess == "encrypted_malware"
+    assert any("ja4" in ev for ev in (score.evidence or []))
+    print(f"✓ test_rules_detect_encrypted_malware_ja4 passed (calibrated: {score.calibrated_probability:.3f})")

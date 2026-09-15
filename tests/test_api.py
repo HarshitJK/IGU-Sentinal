@@ -140,3 +140,47 @@ def test_api_pipeline_end_to_end():
 
     print(f"✓ test_api_pipeline_end_to_end passed ({len(alerts)} alerts, "
           f"{len(threat_class_predictions)} unique threat classes predicted)")
+
+
+def test_api_post_detect_endpoint():
+    """POST /detect endpoint should return valid alert response."""
+    from fastapi.testclient import TestClient
+    from igu_sentinel.api import app
+
+    client = TestClient(app)
+    flow = load_fixture_flows("c2_beaconing")[0]
+    flow_dict = json.loads(flow.model_dump_json())
+
+    response = client.post("/detect", json=[flow_dict])
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 1
+    alert = data[0]
+    assert alert["flow_id"] == flow.flow_id
+    assert "threat_class" in alert
+    assert "confidence_score" in alert
+    assert isinstance(alert["evidence"], list)
+    print(f"✓ test_api_post_detect_endpoint passed (alert: {alert['threat_class']})")
+
+
+def test_api_websocket_alerts_stream():
+    """WebSocket /ws/alerts should receive real-time alerts when /detect processes flows."""
+    from fastapi.testclient import TestClient
+    from igu_sentinel.api import app
+
+    client = TestClient(app)
+    flow = load_fixture_flows("volumetric_ddos")[0]
+    flow_dict = json.loads(flow.model_dump_json())
+
+    with client.websocket_connect("/ws/alerts") as ws:
+        response = client.post("/detect", json=[flow_dict])
+        assert response.status_code == 200
+
+        # Receive streamed alert over WebSocket
+        alert_json = ws.receive_json()
+        assert alert_json["flow_id"] == flow.flow_id
+        assert alert_json["threat_class"] == "volumetric_ddos"
+        assert 0 <= alert_json["confidence_score"] <= 1
+        assert isinstance(alert_json["evidence"], list)
+
+    print("✓ test_api_websocket_alerts_stream passed")

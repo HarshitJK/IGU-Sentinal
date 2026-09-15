@@ -3,6 +3,51 @@ from datetime import datetime
 from igu_sentinel.schemas import LayerScore, Alert
 
 
+# A layer may explicitly vote "benign"; that is NOT an accusation and must never
+# be treated as a threat-class vote in the consensus.
+BENIGN_LABEL = "benign"
+
+# Minimum fused confidence for an alert to be worth surfacing to an analyst.
+# Combined with the existing single-layer downgrade (x0.7), this suppresses
+# "one layer twitched on quiet traffic" without touching the >=2-layer
+# consensus logic that gates the high-confidence tier.
+ALERT_CONFIDENCE_THRESHOLD = 0.5
+
+# Marker added when no layer named any threat class at all.
+NO_CONSENSUS_EVIDENCE = "no_layer_named_a_threat_class"
+
+
+def is_actionable_alert(scores: list[LayerScore], alert: Alert) -> bool:
+    """Decide whether a fused Alert is worth emitting to an analyst.
+
+    The Alert schema is PS-fixed and its ``threat_class`` must be one of the six
+    mandated classes — there is no "benign" alert to emit. So a flow that nothing
+    accused of anything must be dropped rather than labelled. Without this gate
+    every observed flow becomes an alert (and, with no threat vote, inherits the
+    placeholder class), which is exactly the idle-traffic false-positive flood.
+
+    An alert is actionable only when BOTH hold:
+      1. At least one layer actually named a threat class (not None, not benign).
+      2. The fused confidence clears ALERT_CONFIDENCE_THRESHOLD.
+
+    This does not alter the >=2-layer consensus mechanism — it only decides
+    whether the already-fused verdict is surfaced.
+
+    Args:
+        scores: The LayerScores that produced this alert.
+        alert:  The fused Alert from fuse_layers().
+
+    Returns:
+        True if the alert should be logged/broadcast, False to suppress it.
+    """
+    named_threat = any(
+        s.threat_class_guess and s.threat_class_guess != BENIGN_LABEL for s in scores
+    )
+    if not named_threat:
+        return False
+    return alert.confidence_score >= ALERT_CONFIDENCE_THRESHOLD
+
+
 def fuse_layers(scores: list[LayerScore]) -> Alert:
     """Fuse multiple LayerScores into an Alert.
 
@@ -37,7 +82,9 @@ def fuse_layers(scores: list[LayerScore]) -> Alert:
 
     for score in scores:
         layer_probabilities.append(score.calibrated_probability)
-        if score.threat_class_guess:
+        # An explicit "benign" verdict is not an accusation — it must not be
+        # counted as a threat-class vote in the consensus below.
+        if score.threat_class_guess and score.threat_class_guess != BENIGN_LABEL:
             if score.threat_class_guess not in threat_guesses:
                 threat_guesses[score.threat_class_guess] = []
             threat_guesses[score.threat_class_guess].append(score.calibrated_probability)
@@ -56,9 +103,15 @@ def fuse_layers(scores: list[LayerScore]) -> Alert:
         threat_class = sorted_guesses[0][0]
         agreement_count = len(sorted_guesses[0][1])
     else:
-        # No threat class consensus, use highest probability
-        threat_class = "volumetric_ddos"  # Default fallback
+        # No layer named a threat class. The Alert schema requires one of the six
+        # mandated classes, so a placeholder is unavoidable here — but this alert
+        # is NOT actionable and is_actionable_alert() drops it before it reaches
+        # the log or the dashboard. The marker makes that visible if it is ever
+        # inspected directly. (Previously this silently mislabelled quiet traffic
+        # as volumetric_ddos.)
+        threat_class = "volumetric_ddos"  # placeholder only — suppressed downstream
         agreement_count = 0
+        all_evidence.append(NO_CONSENSUS_EVIDENCE)
 
     # Compute fused confidence score
     # Base: average calibrated probability across all layers

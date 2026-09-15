@@ -38,3 +38,29 @@ variants:
     size: 128
     port: 53
     duration: 5
+
+  # Mixed-size flood (SYNs interleaved with large payloads) - the most common
+  # real-world shape, and the range the old config never covered.
+  - threat_class: volumetric_ddos
+    tool: mock
+    source_mode: rand
+    rate: 800
+    size: 800
+    port: 80
+    duration: 5
+
+  - threat_class: volumetric_ddos
+    tool: mock
+    source_mode: fixed
+    rate: 600
+    size: 900
+    port: 443
+    duration: 5
+
+  - threat_class: volumetric_ddos
+    tool: mock
+    source_mode: rand
+    rate: 300
+    size: 700
+    port: 8080
+    duration: 5

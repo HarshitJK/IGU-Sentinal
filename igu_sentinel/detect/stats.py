@@ -116,11 +116,25 @@ def detect_stats(flow: FlowRecord) -> LayerScore:
         if z > 2:
             evidence.append(f"unusual_fanout (z={z:.2f})")
 
-    # Average absolute z-score as anomaly score
-    raw_score = sum(z_scores) / len(z_scores) if z_scores else 0.0
-    # Normalize to [0, 1] using sigmoid-like function
-    # raw_score is typically in [0, 5] range; map to [0, 1]
-    normalized_score = min(raw_score / 5.0, 1.0)
+    # Combine the AVERAGE deviation with the SINGLE LARGEST deviation.
+    #
+    # Averaging alone dilutes a genuine anomaly: a flow that is wildly abnormal
+    # in one dimension but ordinary in five others gets averaged back down to
+    # "normal". That became visible once the benign baseline was widened to
+    # include real high-speed local traffic - a flood is no longer unusual on
+    # inter-arrival, so its remaining strong signals (packet size, byte ratio)
+    # were being washed out. Taking the max alongside the mean preserves
+    # "extremely abnormal in at least one dimension" while keeping genuinely
+    # normal traffic low, since benign flows have a small max z-score too.
+    if z_scores:
+        avg_z = sum(z_scores) / len(z_scores)
+        max_z = max(z_scores)
+        composite = 0.5 * avg_z + 0.5 * max_z
+    else:
+        composite = 0.0
+    raw_score = composite
+    # Normalize to [0, 1]; composite is typically in the [0, 5] range.
+    normalized_score = min(composite / 5.0, 1.0)
 
     # Platt-scale calibration
     try:
