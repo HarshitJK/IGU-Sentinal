@@ -1,189 +1,66 @@
-# IGU Sentinel — Unidirectional AI/ML Network Threat Detection
+# IGU Sentinel — Frontend (batch mode)
 
-> Passive, near real-time AI/ML threat detection for data-diode-fed, one-way network links. Built for **SIH26145** (NTRO — Smart India Hackathon / *Blockchain & Cybersecurity* theme).
+Plain HTML/JS dashboard, no build step. Talks to the existing `api/` FastAPI
+app via `POST /detect`. There is no WebSocket endpoint yet — this is
+Phase-2's `api/` task pending item — so this UI polls/triggers batches
+instead of streaming.
 
----
+## Run it
 
-## Overview
-
-Critical infrastructure operators monitor peering and gateway links using hardware **data diodes** that copy traffic unidirectionally into an isolated monitoring enclave. The enclave gains complete traffic visibility while ensuring zero return path back to production networks.
-
-**IGU Sentinel** serves as the intelligent detection engine inside the monitoring enclave. Operating under strict passive observation constraints, it ingests unidirectional stream flows, extracts statistical and behavioral features without payload decryption, and produces evidence-backed, tamper-evident security alerts.
-
----
-
-## Key Constraints & Guarantees
-
-* **Passive & Unidirectional Only**: Operates without a return path, active probing, or inline block/mitigation capability.
-* **No Payload Decryption**: Analyzes encrypted TLS/QUIC sessions purely from metadata (JA4 fingerprints, packet size distributions, inter-arrival timing).
-* **Streaming Feature Extraction**: Processes flows over a fixed **120ms capture window** to prevent timing manipulation attacks.
-* **Zero Trust Decision Corroboration**: High-confidence alerts require agreement across at least **two independent detection layers**.
-* **Fixed Alert Data Contract**:
-  ```json
-  {
-    "timestamp": "2026-09-13T19:07:00Z",
-    "flow_id": "flow_8a2b3c4d",
-    "threat_class": "c2_beaconing",
-    "confidence_score": 0.89,
-    "evidence": ["regular_beacon_interval", "unusual_inter_arrival_time"]
-  }
-  ```
-
----
-
-## System Architecture
-
-```
-[Production Network]            [Hardware Diode: One-Way]       [Monitoring Enclave]
-Traffic Generators      ───►  Relay + iptables DROP return  ───► Ingest (tshark 120ms)
-(iperf3/dnscat2/hping3)                                                   │
-                                                                          ▼
-                                                               4-Layer Detection Engine
-                                                               (Rules, Stats, IsoForest, XGB)
-                                                                          │
-                                                                          ▼
-                                                                Cross-Layer Fusion
-                                                                (Platt Calibration)
-                                                                          │
-                                                                          ▼
-                                                                Hash-Chained Alert Log
-                                                                (SHA-256 Audit Trail)
-```
-
----
-
-## 4-Layer Detection Engine
-
-IGU Sentinel evaluates incoming flow metadata through four parallel detection modules:
-
-1. **Static IOC & Rule Engine (`igu_sentinel/detect/rules.py`)**:
-   Heuristic checks for volumetric bursts, low inter-arrival times, DNS n-gram entropy/fanout, port scanning, and anomalous byte ratios.
-2. **Z-Score Statistical Baseline (`igu_sentinel/detect/stats.py`)**:
-   Z-score deviation detector trained on benign flow distributions across packet sizes, timing, entropy, and TTL.
-3. **Unsupervised Isolation Forest (`igu_sentinel/detect/isoforest.py`)**:
-   Distance-based anomaly detector trained on benign-only traffic, scoring flow isolation depth in feature space.
-4. **Supervised Multi-Class Classifier (`igu_sentinel/detect/xgb.py`)**:
-   Per-class threat predictor mapping flows into PS-mandated threat classes.
-
-### Supported Threat Classes (PS-Mandated)
-| Threat Class | Primary Signal |
-|---|---|
-| `volumetric_ddos` | Flow rate spikes, low inter-arrival times |
-| `c2_beaconing` | Periodic callbacks, low inter-arrival variance, JA4 fingerprints |
-| `dga_dns_tunneling` | High DNS n-gram entropy, elevated query fanout |
-| `encrypted_malware` | Suspicious port/entropy combinations, TLS metadata |
-| `recon_scanning` | Ephemeral ports, small probe packet fanouts |
-| `data_exfiltration` | Asymmetric outbound byte ratios, large sustained transfers |
-
----
-
-## Additional Core Systems
-
-* **Cross-Layer Score Fusion (`igu_sentinel/fusion/`)**:
-  Calibrates layer outputs into probabilities via Platt scaling and applies multi-layer corroboration gates.
-* **Tamper-Evident SHA-256 Audit Chain (`igu_sentinel/alert/`)**:
-  Maintains a cryptographic blockchain-style hash chain (`prev_hash` $\rightarrow$ `hash`) for forensic chain of custody verification.
-* **PSI Score Drift Monitoring (`igu_sentinel/drift/`)**:
-  Calculates Population Stability Index ($PSI > 0.2$) over rolling score windows and triggers bounded retrain events without discarding baseline models.
-* **Config-Driven Traffic Generator (`igu_sentinel/traffic_gen/`)**:
-  Synthetic dataset generation harness driven by YAML variant configs.
-
----
-
-## Project Structure
-
-```
-IGU-Sentinal/
-├── Makefile                          # Development and orchestration targets
-├── Dockerfile                        # Sentinel FastAPI service container setup
-├── docker-compose.yml                # Full stack: Sentinel, Diode, Traffic Generators, Test Containers
-├── requirements.txt                  # Python dependencies
-├── run_tests.py                      # Standalone test runner
-├── igu_sentinel/
-│   ├── schemas.py                    # Pydantic data contracts (FlowRecord, LayerScore, Alert)
-│   ├── ingest/                       # tshark PCAP capture & feature extraction
-│   ├── detect/                       # 4 detection layers (rules, stats, isoforest, xgb)
-│   ├── fusion/                       # Platt scaling & cross-layer corroboration
-│   ├── alert/                        # Hash-chained (SHA-256) audit logging & verification
-│   ├── drift/                        # PSI score distribution monitoring & retrain trigger
-│   ├── traffic_gen/                  # Config-driven traffic generator harness
-│   └── api/                          # FastAPI REST application (/health, /detect)
-└── tests/                            # Unit and integration test suite & JSONL fixtures
-```
-
----
-
-## Quick Start & Usage
-
-### Prerequisites
-* Python 3.11+
-* Docker & Docker Compose (optional for containerized deployment)
-* `tshark` (Wireshark CLI, optional for live PCAP ingest)
-
-### 1. Local Environment Setup
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-### 2. Available Commands (`Makefile`)
-The repository includes a comprehensive `Makefile`:
+Just open `index.html` in a browser, or serve the folder:
 
 ```bash
-make help        # List all available targets and descriptions
-make test-unit   # Run fast unit tests (0.3s, no Docker required)
-make test        # Run full pytest suite with virtualenv activated
-make build       # Build Docker containers via docker-compose
-make up          # Start all containers in background
-make diode-proof # Up stack, run prod-test -> enclave-test ping check, print pass/fail
-make gen-data    # Generate labeled synthetic flow datasets in datasets/
-make down        # Teardown stack and remove volumes
-make clean       # Clean caches and prompt before removing .venv
+cd frontend
+python -m http.server 5500
 ```
 
-### 3. Live Streaming Capture (P5B)
+Then set the "API Base URL" field to wherever the FastAPI app is running
+(default assumed: `http://localhost:8000`).
 
-Run the service, then capture a live interface. Each fixed **120ms window** of
-captured flows is scored by the same detect → fusion → alert pipeline as
-`POST /detect`, and alerts stream to every `/ws/alerts` client in real time.
+## Required backend change: CORS
 
-```bash
-# Start the API
-uvicorn igu_sentinel.api:app --host 0.0.0.0 --port 8000
+The current `api/` app has no `CORSMiddleware`, so browser requests from
+this frontend (a different origin/port) will be blocked. Add to the FastAPI
+app:
 
-# Start live capture on an interface (JSON body)
-curl -X POST http://127.0.0.1:8000/capture/start \
-     -H 'Content-Type: application/json' -d '{"interface":"en0","window_ms":120}'
+```python
+from fastapi.middleware.cors import CORSMiddleware
 
-curl http://127.0.0.1:8000/capture/status   # status + windows/alerts counters
-curl -X POST http://127.0.0.1:8000/capture/stop
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten before demo/prod
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 ```
 
-Live capture endpoints:
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/capture/start` | POST | Begin live capture (`{"interface", "window_ms"?}`) |
-| `/capture/stop`  | POST | Stop the active capture |
-| `/capture/status`| GET  | Current status and windows/alerts counters |
+## How it works
 
-> **Capture permissions:** live capture needs raw-packet access. On macOS install
-> ChmodBPF (`brew install --cask wireshark-chmodbpf`, then re-login) or run under
-> `sudo`; on Linux `sudo setcap cap_net_raw,cap_net_admin+eip $(which tshark)`.
-> A missing/invalid interface or missing permission returns a clear error from
-> `/capture/start` (HTTP 400) and never crashes the service.
+- Load flows either via a fixture JSONL/JSON file or by pasting a
+  FlowRecord JSON array into the textarea.
+- "Run Detection" POSTs the flows to `/detect` and renders the returned
+  `Alert` list.
+- "Auto re-run" re-submits the same loaded flows on an interval — this is
+  a stand-in for live streaming, not real new traffic.
+- Chain status pill shows "n/a" because the current `Alert` schema
+  (`schemas.py`) has no hash-chain fields — those live in the pending
+  `alert/` module. Once that's wired into the API response, extend
+  `normalizeAlert()` in `app.js` to read `prev_hash`/`hash`/`verified`
+  and flip the pill to ok/broken.
 
----
+## Swapping in the WebSocket later
 
-## Performance Benchmark
+All alert-fetching logic is isolated in `dataSource.js` behind a small
+interface (`onAlerts`, `onError`, `onModeChange`, `runDetection`/`connect`).
+When the backend adds a WS endpoint:
 
-Measured sustained performance through the in-process detection and fusion pipeline:
-* **Throughput**: $>40,000 \text{ flows/sec}$
-* **Average Latency**: $\sim 0.03 \text{ ms}$ per flow
-* **Test Suite**: 73 passing unit tests / 63 integration tests
+1. Confirm the URL path and message shape (single `Alert` per message vs.
+   batched array).
+2. In `dataSource.js`, finish `WebSocketAlertSource` (already stubbed) to
+   match that shape.
+3. In `app.js`, change `createAlertSource()` to return
+   `new WebSocketAlertSource(apiBase)` and call `.connect()` instead of
+   `.startPolling()`.
 
----
-
-## License
-
-Developed for **SIH26145** (NTRO). All rights reserved.
+No other file needs to change — `app.js` only talks to the `source`
+interface, not to fetch/WebSocket directly.
