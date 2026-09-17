@@ -46,16 +46,31 @@ KNOWN_MALICIOUS_JA4 = {
 
 
 def is_malicious_ja4(ja4: Optional[str]) -> bool:
-    """Return True if JA4 matches known malware fingerprints or signature patterns."""
+    """Return True only for JA4 fingerprints on the known-malicious IOC list.
+
+    This is an exact-match IOC check and nothing else.
+
+    It previously also returned True for *any* fingerprint whose SNI flag was
+    'i' (no domain SNI). That was wrong in three compounding ways:
+
+      * No SNI is ordinary, not malicious — every TLS connection made to a bare
+        IP has it, which on a monitored segment includes health checks, probes,
+        container-to-container traffic and captive-portal checks. It is a weak
+        signal, so it belongs to the weighted rule that corroborates it with
+        payload entropy, not to a hard IOC verdict worth +0.40.
+      * It made :func:`has_no_sni_ja4` redundant, so the `elif has_no_sni_ja4`
+        branch in ``detect/rules.py`` was unreachable dead code — the weaker,
+        corroborated rule could never fire because the stronger uncorroborated
+        one always won first.
+      * Features 13 and 14 of the model vector became perfectly collinear,
+        wasting a dimension and letting the classifier key on "no SNI" alone.
+
+    The no-SNI signal is still available via :func:`has_no_sni_ja4`, which is
+    where it is correctly weighted.
+    """
     if not ja4:
         return False
-    if ja4 in KNOWN_MALICIOUS_JA4:
-        return True
-    if len(ja4) >= 10:
-        # 'i' indicates missing domain SNI (connecting directly to IP or custom C2)
-        if ja4[3] == "i":
-            return True
-    return False
+    return ja4 in KNOWN_MALICIOUS_JA4
 
 
 def has_no_sni_ja4(ja4: Optional[str]) -> bool:

@@ -8,15 +8,20 @@ import subprocess
 import time
 from pathlib import Path
 
+import yaml
 
-def run_command(cmd, timeout=30):
-    """Run a shell command and return stdout, stderr, returncode."""
+from tests.conftest import compose_command
+
+
+def run_command(cmd, timeout=30, cwd=None):
+    """Run a command (list or str) and return stdout, stderr, returncode."""
     result = subprocess.run(
         cmd,
-        shell=True,
+        shell=isinstance(cmd, str),
         capture_output=True,
         text=True,
-        timeout=timeout
+        timeout=timeout,
+        cwd=cwd,
     )
     return result.stdout.strip(), result.stderr.strip(), result.returncode
 
@@ -27,8 +32,9 @@ def docker_compose_up():
     compose_file = root_dir / "docker-compose.yml"
 
     stdout, stderr, rc = run_command(
-        f"cd {root_dir} && docker-compose -f {compose_file} up -d",
-        timeout=60
+        [*compose_command().split(), "-f", str(compose_file), "up", "-d"],
+        timeout=60,
+        cwd=str(root_dir),
     )
 
     if rc != 0:
@@ -45,8 +51,9 @@ def docker_compose_down():
     compose_file = root_dir / "docker-compose.yml"
 
     stdout, stderr, rc = run_command(
-        f"cd {root_dir} && docker-compose -f {compose_file} down -v",
-        timeout=60
+        [*compose_command().split(), "-f", str(compose_file), "down", "-v"],
+        timeout=60,
+        cwd=str(root_dir),
     )
 
     if rc != 0:
@@ -93,25 +100,60 @@ def test_diode_container_exists():
 
 
 def test_diode_iptables_rules_configured():
-    """Verify diode docker-compose has iptables rules in its command."""
+    """Verify the diode installs, and verifies, one-way iptables rules.
+
+    Asserts the *properties* the diode must have rather than literal interface
+    names. The rules used to be pinned to eth0/eth1, but Docker does not
+    guarantee that the first network listed becomes eth0 — so the one-way rules
+    could be installed backwards, inverting the diode with no visible error. The
+    command now resolves each interface from its network's subnet.
+    """
     root_dir = Path(__file__).parent.parent
     compose_file = root_dir / "docker-compose.yml"
 
     with open(compose_file) as f:
         content = f.read()
 
-    # Check for the key iptables commands
-    assert 'iptables -P FORWARD DROP' in content, (
-        "Diode must set iptables FORWARD policy to DROP"
-    )
-    assert 'iptables -A FORWARD -i eth0 -o eth1 -j ACCEPT' in content, (
-        "Diode must allow forward traffic from eth0 to eth1"
-    )
-    assert 'iptables -A FORWARD -i eth1 -o eth0 -j DROP' in content, (
-        "Diode must DROP return traffic from eth1 to eth0"
+    compose_config = yaml.safe_load(content)
+    diode = compose_config["services"]["diode"]
+    command = "\n".join(
+        part for part in diode["command"] if isinstance(part, str)
     )
 
-    print(f"✓ Diode configured with iptables one-way rules")
+    # Default-deny, then exactly one permitted direction.
+    assert "iptables -P FORWARD DROP" in command, (
+        "Diode must set the iptables FORWARD policy to DROP"
+    )
+    assert '-i "$$ENCL_IF" -o "$$PROD_IF" -j ACCEPT' in command, (
+        "Diode must allow enclave -> prod forwarding"
+    )
+    assert '-i "$$PROD_IF" -o "$$ENCL_IF" -j DROP' in command, (
+        "Diode must DROP the prod -> enclave return path"
+    )
+
+    # Interfaces resolved from subnets, not assumed from Docker's ordering.
+    assert "ip -o -4 addr show" in command, (
+        "Diode must resolve its interfaces at runtime, not hardcode eth0/eth1"
+    )
+
+    # The rules must be read back: a diode that cannot prove its own
+    # enforcement must not report itself online.
+    assert "iptables -C FORWARD" in command, (
+        "Diode must verify its rules were actually installed"
+    )
+
+    # An image that actually ships iptables. busybox does not, so every rule
+    # failed with 'iptables: not found' while the container reported ready.
+    assert "busybox" not in diode["image"], (
+        "busybox has no iptables applet — the diode would enforce nothing"
+    )
+
+    # Fail-closed: any failing step must kill the container.
+    assert "-eu" in diode["command"], (
+        "Diode command must run with `set -eu` so a failed rule is fatal"
+    )
+
+    print("✓ Diode configured with verified, subnet-resolved one-way iptables rules")
 
 
 def test_diode_has_net_admin_capability():

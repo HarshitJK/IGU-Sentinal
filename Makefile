@@ -1,19 +1,26 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build up down logs test test-unit diode-proof gen-data clean frontend frontend-dev frontend-open frontend-check dashboard
+# Docker removed the `docker-compose` v1 binary in favour of the `docker compose`
+# plugin; hardcoding v1 made every container target fail on a current install.
+COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo "docker-compose")
+PY := .venv/bin/python
+
+.PHONY: help venv build up down logs test test-unit benchmark diode-proof gen-data clean frontend frontend-dev frontend-open frontend-check dashboard
 
 help: ## Show descriptions of all available targets
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Available targets:"
 	@echo "  help           - Show one-line descriptions of all available targets"
-	@echo "  build          - Build Docker images using docker-compose build"
-	@echo "  up             - Start containers in background using docker-compose up -d"
-	@echo "  down           - Stop and remove containers and volumes using docker-compose down -v"
-	@echo "  logs           - Tail container logs using docker-compose logs -f"
+	@echo "  build          - Build Docker images using $(COMPOSE) build"
+	@echo "  up             - Start containers in background using $(COMPOSE) up -d"
+	@echo "  down           - Stop and remove containers and volumes using $(COMPOSE) down -v"
+	@echo "  logs           - Tail container logs using $(COMPOSE) logs -f"
+	@echo "  venv           - Create .venv and install pinned requirements"
 	@echo "  test           - Run full pytest suite (source .venv, pytest -v)"
 	@echo "  test-unit      - Run fast unit tests without Docker dependencies (pytest -v)"
 	@echo "  diode-proof    - Start stack, run prod-test -> enclave-test ping check, print pass/fail, then stop stack"
+	@echo "  benchmark      - Measure sustained flows/sec and end-to-end latency"
 	@echo "  gen-data       - Generate labeled datasets from YAML configs into datasets/ directory"
 	@echo "  frontend       - Start the Sentinel API and serve live dashboard at http://localhost:8000/dashboard"
 	@echo "  frontend-dev   - Start Sentinel API in auto-reload development mode for frontend iteration"
@@ -21,17 +28,23 @@ help: ## Show descriptions of all available targets
 	@echo "  frontend-check - Validate existence and integrity of frontend HTML dashboard"
 	@echo "  clean          - Remove __pycache__, .pytest_cache, and prompt before removing .venv"
 
+venv: ## Create .venv and install pinned requirements
+	python3 -m venv .venv
+	$(PY) -m pip install --upgrade pip
+	$(PY) -m pip install -r requirements.txt
+	@echo "Virtualenv ready. Run 'make test'."
+
 build: ## Build Docker images
-	docker-compose build
+	$(COMPOSE) build
 
 up: ## Start containers in background
-	docker-compose up -d
+	$(COMPOSE) up -d
 
 down: ## Stop and remove containers and volumes
-	docker-compose down -v
+	$(COMPOSE) down -v
 
 logs: ## Tail container logs
-	docker-compose logs -f
+	$(COMPOSE) logs -f
 
 test: ## Run full pytest suite with virtualenv activated
 	bash -c "source .venv/bin/activate && pytest -v"
@@ -41,17 +54,20 @@ test-unit: ## Run fast unit tests without Docker dependencies
 
 diode-proof: ## Up stack, run prod-test -> enclave-test ping check, print pass/fail, then down
 	@echo "Starting containers..."
-	docker-compose up -d
+	$(COMPOSE) up -d
 	@sleep 3
 	@echo "Testing diode return-path ping (prod-test -> enclave-test)..."
 	@if docker exec igusentinel-prod-test ping -c 1 -W 2 igusentinel-enclave-test >/dev/null 2>&1; then \
 		echo "diode-proof: FAIL (traffic passed through, diode failed to block)"; \
-		docker-compose down -v; \
+		$(COMPOSE) down -v; \
 		exit 1; \
 	else \
 		echo "diode-proof: PASS (return traffic blocked by diode iptables)"; \
 	fi
-	docker-compose down -v
+	$(COMPOSE) down -v
+
+benchmark: ## Measure sustained flows/sec and end-to-end latency through the pipeline
+	bash -c "source .venv/bin/activate && python -m igu_sentinel.benchmark --flows 2000 --repeats 3"
 
 gen-data: ## Run traffic generator against all configs and output to datasets/
 	bash -c "source .venv/bin/activate && python -c \"\

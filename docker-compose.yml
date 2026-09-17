@@ -13,56 +13,75 @@ services:
     depends_on:
       - diode
 
-  # Diode container: one-way relay with iptables enforcement
-  # Enforces unidirectional traffic via iptables rules
-  # Attached to both bridge networks (prod-net, enclave-net) and macvlan networks
+  # Diode container: one-way relay with iptables enforcement.
+  #
+  # Enforcement correctness notes — this container IS the security boundary, so
+  # it must fail loudly rather than pretend:
+  #   * It runs alpine, not busybox. busybox ships no iptables applet, so every
+  #     rule below used to fail with "iptables: not found" while the script —
+  #     which had no `set -e` — carried on and printed "Diode online". The diode
+  #     advertised enforcement it had never applied.
+  #   * `set -eu` makes any failed step kill the container instead of leaving a
+  #     permissive box that looks healthy.
+  #   * Interfaces are resolved from the network subnets at runtime. Docker does
+  #     not guarantee that the first network in the list becomes eth0, so the
+  #     hardcoded eth0/eth1 rules could be installed backwards — silently
+  #     inverting the diode's direction.
+  #   * The rules are read back and verified before the container reports ready.
   diode:
-    image: busybox:latest
+    image: alpine:3.20
     networks:
       - prod-net
       - enclave-net
-      - macvlan-prod
-      - macvlan-enclave
     container_name: igusentinel-diode
     cap_add:
       - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      # Set via sysctls, not `echo > /proc/sys/...`: /proc/sys is read-only in an
+      # unprivileged container, so the echo silently failed.
+      - net.ipv4.ip_forward=1
     entrypoint: /bin/sh
     command:
+      - -eu
       - -c
       - |
-        echo 'Diode: setting up iptables one-way relay rules'
-        echo 1 > /proc/sys/net/ipv4/ip_forward
+        apk add --no-cache iptables iproute2 >/dev/null
+        echo 'Diode: resolving interfaces from network subnets'
+        # prod-net and enclave-net get distinct subnets (see networks: below).
+        PROD_IF=$$(ip -o -4 addr show | awk '$$4 ~ /^172\.31\.10\./ {print $$2; exit}')
+        ENCL_IF=$$(ip -o -4 addr show | awk '$$4 ~ /^172\.31\.20\./ {print $$2; exit}')
+        if [ -z "$$PROD_IF" ] || [ -z "$$ENCL_IF" ]; then
+          echo "Diode FATAL: could not resolve interfaces (prod=$$PROD_IF enclave=$$ENCL_IF)" >&2
+          ip -o -4 addr show >&2
+          exit 1
+        fi
+        echo "Diode: prod=$$PROD_IF enclave=$$ENCL_IF"
         iptables -P FORWARD DROP
-        iptables -A FORWARD -i eth0 -o eth1 -j ACCEPT
-        iptables -A FORWARD -i eth1 -o eth0 -j DROP
-        echo 'iptables rules: FORWARD DROP default, eth0->eth1 ACCEPT, eth1->eth0 DROP'
+        iptables -F FORWARD
+        # One direction only: enclave -> prod. Nothing returns.
+        iptables -A FORWARD -i "$$ENCL_IF" -o "$$PROD_IF" -j ACCEPT
+        iptables -A FORWARD -i "$$PROD_IF" -o "$$ENCL_IF" -j DROP
+        # Verify the rules are actually installed before claiming readiness.
+        iptables -C FORWARD -i "$$ENCL_IF" -o "$$PROD_IF" -j ACCEPT
+        iptables -C FORWARD -i "$$PROD_IF" -o "$$ENCL_IF" -j DROP
+        iptables -S FORWARD | grep -q -- '-P FORWARD DROP'
+        echo 'Diode: rules verified —'
+        iptables -S FORWARD
         echo 'Diode online'
         exec sleep infinity
     restart: unless-stopped
 
-  # Router service: macvlan-attached gateway endpoint for host routing sandbox
-  # Provides stable gateway IPs on macvlan-prod and macvlan-enclave networks
-  # Does not run application logic; host routes traffic through this container
-  router:
-    image: busybox:latest
-    networks:
-      macvlan-prod:
-        ipv4_address: 192.168.2.254
-      macvlan-enclave:
-        ipv4_address: 192.168.3.254
-    container_name: igusentinel-router
-    cap_add:
-      - NET_ADMIN
-    entrypoint: /bin/sh
-    command:
-      - -c
-      - |
-        echo 'Router: gateway endpoint online'
-        echo 'Prod side IP: 192.168.2.254'
-        echo 'Enclave side IP: 192.168.3.254'
-        echo 'Waiting for sandbox setup...'
-        exec sleep infinity
-    restart: unless-stopped
+  # NOTE: the macvlan host-routing sandbox (macvlan-prod, macvlan-enclave and
+  # the `router` service) lives in docker-compose.macvlan.yml, not here. Those
+  # networks pin `parent: wlp8s0`, a Linux wireless interface name that exists
+  # on exactly one developer's machine — with them in the base file, `docker
+  # compose up` failed at network creation on every other host, so the whole
+  # stack (and every Docker-dependent test) was unrunnable anywhere else.
+  # Bring the sandbox up explicitly, with the parent interface overridden:
+  #
+  #   DIODE_MACVLAN_PARENT=eth0 docker compose \
+  #       -f docker-compose.yml -f docker-compose.macvlan.yml up -d
 
   # Test container on prod-net
   prod-test:
@@ -94,32 +113,20 @@ services:
       - PYTHONUNBUFFERED=1
 
 networks:
+  # Subnets are pinned so the diode can resolve which of its interfaces faces
+  # which side. Relying on Docker's interface ordering (eth0/eth1) was not safe:
+  # the order is not guaranteed, so the one-way rules could be installed
+  # backwards, inverting the diode without any visible error.
   prod-net:
     driver: bridge
     name: prod-net
+    ipam:
+      config:
+        - subnet: 172.31.10.0/24
 
   enclave-net:
     driver: bridge
     name: enclave-net
-
-  # Macvlan networks for host-routing sandbox
-  # Attached to host's physical interface (wlp8s0)
-  macvlan-prod:
-    driver: macvlan
-    driver_opts:
-      parent: wlp8s0
     ipam:
       config:
-        - subnet: 192.168.2.0/24
-          gateway: 192.168.2.1
-    name: macvlan-prod
-
-  macvlan-enclave:
-    driver: macvlan
-    driver_opts:
-      parent: wlp8s0
-    ipam:
-      config:
-        - subnet: 192.168.3.0/24
-          gateway: 192.168.3.1
-    name: macvlan-enclave
+        - subnet: 172.31.20.0/24

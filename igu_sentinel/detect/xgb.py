@@ -16,11 +16,15 @@ Model lifecycle:
 """
 
 import logging
+import threading
 from pathlib import Path
 from typing import Optional, List
 
 from igu_sentinel.schemas import FlowRecord, LayerScore
 from igu_sentinel.detect.features import extract_features, FEATURE_DIM
+# Shared with isoforest so there is one definition of how an artifact is
+# pinned and how its digest is checked.
+from igu_sentinel.detect.isoforest import _pinned_model_name, verify_artifact
 
 log = logging.getLogger(__name__)
 
@@ -41,8 +45,11 @@ _MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 _MODEL_STEM = "xgb_v"
 
 # ── in-memory state ──────────────────────────────────────────────────────────
-_model = None            # XGBClassifier instance (or None)
-_label_encoder = None    # maps int indices ↔ class name strings
+# Model and label map are only meaningful as a pair — a model swapped in while
+# the previous label map is still installed mislabels every prediction. They are
+# rebound together under a lock (see isoforest for the same reasoning).
+_state_lock = threading.Lock()
+_state: Optional[tuple] = None   # (model, label_encoder)
 
 
 def _model_files() -> List[Path]:
@@ -74,14 +81,48 @@ def _next_version() -> int:
 
 
 def _latest_model_path() -> Optional[Path]:
-    """Return path to the highest-numbered saved model JSON, or None."""
+    """Return the artifact to serve: the one pinned in models/CURRENT, else
+    the highest version.
+
+    The highest-version rule is what caused the worst defect found in this
+    codebase: xgb_v14.json, a degraded 5-class model written by a test run,
+    outranked the healthy 7-class v13 and became what the service loaded.
+    recon_scanning and data_exfiltration were absent from the model entirely,
+    and overall accuracy was 0.332 against v13's 1.000. The pointer makes the
+    served version a declaration instead of an accident.
+    """
+    pinned = _pinned_model_name("xgb")
+    if pinned:
+        candidate = _MODELS_DIR / pinned
+        if candidate.exists() and candidate.resolve().parent == _MODELS_DIR.resolve():
+            return candidate
+        log.error("models/CURRENT pins %r which is missing — falling back", pinned)
     existing = _model_files()
     return existing[-1] if existing else None
 
 
+def _swap_state(model, label_encoder) -> None:
+    """Atomically install a new (model, label map) pair."""
+    global _state
+    with _state_lock:
+        _state = (model, label_encoder)
+
+
+def _current_state() -> Optional[tuple]:
+    """Read the active model and label map as one consistent snapshot."""
+    with _state_lock:
+        return _state
+
+
 def _load_model_from_disk() -> bool:
-    """Try to load latest persisted XGB model + label map; return True on success."""
-    global _model, _label_encoder
+    """Try to load latest persisted XGB model + label map; return True on success.
+
+    The label map is validated against THREAT_CLASSES on load. A corrupt or
+    stale map used to survive here and surface later as a threat_class_guess
+    like "class_4", which fusion then handed to Alert() — and Alert rejects any
+    class outside the six mandated ones, so a bad artifact crashed the scoring
+    path per flow instead of failing once, loudly, at load time.
+    """
     model_path = _latest_model_path()
     if model_path is None:
         return False
@@ -91,14 +132,30 @@ def _load_model_from_disk() -> bool:
         import xgboost as xgb
         import json as _json
 
+        resolved = model_path.resolve()
+        if resolved.parent != _MODELS_DIR.resolve():
+            log.error("xgb: refusing to load model outside models/: %s", resolved)
+            return False
+
+        if not verify_artifact(resolved):
+            return False
         model = xgb.XGBClassifier()
-        model.load_model(str(model_path))
+        model.load_model(str(resolved))
         if label_path.exists():
             with open(label_path) as fh:
-                _label_encoder = _json.load(fh)
+                label_encoder = _json.load(fh)
         else:
-            _label_encoder = {i: c for i, c in enumerate(THREAT_CLASSES)}
-        _model = model
+            label_encoder = {i: c for i, c in enumerate(THREAT_CLASSES)}
+
+        unknown = {c for c in label_encoder.values() if c not in THREAT_CLASSES}
+        if unknown:
+            log.error(
+                "xgb: %s maps to unknown classes %s — refusing to load",
+                label_path.name, sorted(unknown),
+            )
+            return False
+
+        _swap_state(model, label_encoder)
         log.info("xgb: loaded %s", model_path.name)
         return True
     except Exception as exc:
@@ -123,8 +180,6 @@ def train_xgb(flows: list[FlowRecord], labels: list[str]) -> None:
         ValueError: If inputs are inconsistent.
         ImportError: If xgboost or numpy are not installed.
     """
-    global _model, _label_encoder
-
     if len(flows) != len(labels):
         raise ValueError("flows and labels must have equal length.")
     if not flows:
@@ -164,15 +219,17 @@ def train_xgb(flows: list[FlowRecord], labels: list[str]) -> None:
         [n_total / (num_classes * counts[yi]) for yi in y], dtype=float
     )
 
+    # num_class and use_label_encoder were removed from the public contract in
+    # xgboost 2.0 (num_class is inferred; use_label_encoder is a no-op). They
+    # were still being passed, implying a version constraint that no longer
+    # applies.
     model = xgb.XGBClassifier(
         objective="multi:softprob",
-        num_class=num_classes,
         n_estimators=200,
         max_depth=6,
         learning_rate=0.1,
         subsample=0.8,
         colsample_bytree=0.8,
-        use_label_encoder=False,
         eval_metric="mlogloss",
         random_state=42,
         n_jobs=-1,
@@ -192,13 +249,109 @@ def train_xgb(flows: list[FlowRecord], labels: list[str]) -> None:
 
     log.info("xgb: saved %s (classes=%s, n=%d)", model_path.name, ordered, len(flows))
 
-    # Hot-swap in memory.
-    _model = model
-    _label_encoder = int_to_label
+    # Hot-swap in memory as one atomic rebind — see _state.
+    _swap_state(model, int_to_label)
+
+
+def predict_xgb_batch(flows: list[FlowRecord]) -> list[LayerScore]:
+    """Classify a batch of flows in a single model call.
+
+    XGBoost's ``predict_proba`` has a fixed per-call cost that dominates the
+    work of classifying one 16-feature row: measured on the fixture corpus, one
+    flow at a time runs at ~1,080 flows/sec while the same rows as one matrix
+    run at ~397,000 flows/sec. Since a fixed 120ms capture window already
+    produces a batch, this is the natural shape for the hot path.
+
+    Args:
+        flows: FlowRecords to classify.
+
+    Returns:
+        One LayerScore per input flow, in the same order.
+
+    Raises:
+        RuntimeError: If no model has been trained or loaded.
+    """
+    if not flows:
+        return []
+
+    state = _current_state()
+    if state is None:
+        if not _load_model_from_disk():
+            raise RuntimeError(
+                "XGBoost model not available. "
+                "Call train_xgb() or run train_models.py first."
+            )
+        state = _current_state()
+
+    # One consistent snapshot so a concurrent retrain cannot pair this model
+    # with the previous label map.
+    model, label_encoder = state
+
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise ImportError("numpy required for scoring: pip install numpy") from exc
+
+    X = np.array([extract_features(f) for f in flows], dtype=float)
+    probas = model.predict_proba(X)
+
+    # Resolve the index -> class-name mapping once for the whole batch. The
+    # label map survives a JSON round-trip with string keys but is built with
+    # int keys in-process, so try both. An index with no label is dropped rather
+    # than invented as "class_<i>": an invented name would propagate through
+    # fusion into Alert(threat_class=...), which only accepts the six mandated
+    # classes, and crash the scoring path.
+    index_to_class = {}
+    for i in range(probas.shape[1]):
+        cls = label_encoder.get(str(i), label_encoder.get(i))
+        if cls is None:
+            log.warning("xgb: model output index %d has no label — ignoring", i)
+            continue
+        index_to_class[i] = cls
+
+    results: list[LayerScore] = []
+    for flow, proba in zip(flows, probas):
+        class_probs = {cls: float(proba[i]) for i, cls in index_to_class.items()}
+
+        # Separate benign probability from threat class probabilities.
+        benign_prob = class_probs.get("benign", 0.0)
+        threat_probs = {k: v for k, v in class_probs.items() if k != "benign"}
+
+        # The "threat score" is the total probability NOT assigned to benign.
+        raw_score = max(0.0, min(1.0, float(1.0 - benign_prob)))
+
+        best_threat = max(threat_probs, key=threat_probs.get) if threat_probs else None
+
+        # Only emit a threat_class_guess when the model positively prefers a
+        # threat class over benign, and only for a class Alert will accept.
+        threat_class_guess = best_threat if benign_prob < 0.5 else None
+        if threat_class_guess is not None and threat_class_guess not in VALID_THREAT_CLASSES:
+            log.warning("xgb: dropping out-of-schema class guess %r", threat_class_guess)
+            threat_class_guess = None
+
+        # Evidence: top-2 classes for interpretability.
+        top2 = sorted(class_probs.items(), key=lambda kv: kv[1], reverse=True)[:2]
+        evidence = [f"{cls}={prob:.3f}" for cls, prob in top2]
+
+        results.append(
+            LayerScore(
+                flow_id=flow.flow_id,
+                layer_name="xgb",
+                raw_score=raw_score,
+                calibrated_probability=raw_score,  # softprob already calibrated
+                threat_class_guess=threat_class_guess,
+                evidence=evidence,
+            )
+        )
+    return results
 
 
 def predict_xgb(flow: FlowRecord) -> LayerScore:
     """Classify a flow using the trained XGBClassifier.
+
+    This is the per-flow contract from CLAUDE.md (FlowRecord -> LayerScore). It
+    delegates to :func:`predict_xgb_batch`, so there is exactly one prediction
+    implementation. Prefer the batch form on the hot path.
 
     Args:
         flow: FlowRecord to evaluate.
@@ -213,58 +366,4 @@ def predict_xgb(flow: FlowRecord) -> LayerScore:
     Raises:
         RuntimeError: If no model has been trained or loaded.
     """
-    global _model, _label_encoder
-
-    if _model is None:
-        if not _load_model_from_disk():
-            raise RuntimeError(
-                "XGBoost model not available. "
-                "Call train_xgb() or run train_models.py first."
-            )
-
-    try:
-        import numpy as np
-    except ImportError as exc:
-        raise ImportError("numpy required for scoring: pip install numpy") from exc
-
-    X = np.array([extract_features(flow)], dtype=float)
-    proba = _model.predict_proba(X)[0]  # shape: (num_classes,)
-
-    # Build class→probability map.
-    class_probs = {
-        _label_encoder[str(i)] if str(i) in _label_encoder else _label_encoder.get(i, f"class_{i}"): float(p)
-        for i, p in enumerate(proba)
-    }
-
-    # Separate benign probability from threat class probabilities.
-    benign_prob = class_probs.get("benign", 0.0)
-    threat_probs = {k: v for k, v in class_probs.items() if k != "benign"}
-
-    # The "threat score" is the total probability NOT assigned to benign.
-    raw_score = float(1.0 - benign_prob)
-    raw_score = max(0.0, min(1.0, raw_score))
-
-    # Predicted threat class: argmax over threat classes.
-    if threat_probs:
-        best_threat = max(threat_probs, key=lambda k: threat_probs[k])
-        best_threat_prob = threat_probs[best_threat]
-    else:
-        best_threat = None
-        best_threat_prob = 0.0
-
-    # Only emit a threat_class_guess when the model positively prefers a
-    # threat class over benign (i.e. benign is not the winner).
-    threat_class_guess = best_threat if benign_prob < 0.5 else None
-
-    # Evidence: top-2 classes for interpretability.
-    sorted_classes = sorted(class_probs.items(), key=lambda kv: kv[1], reverse=True)
-    evidence = [f"{cls}={prob:.3f}" for cls, prob in sorted_classes[:2]]
-
-    return LayerScore(
-        flow_id=flow.flow_id,
-        layer_name="xgb",
-        raw_score=raw_score,
-        calibrated_probability=raw_score,  # softprob already calibrated
-        threat_class_guess=threat_class_guess,
-        evidence=evidence,
-    )
+    return predict_xgb_batch([flow])[0]

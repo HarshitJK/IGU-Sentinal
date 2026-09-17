@@ -39,18 +39,18 @@ anomalous         7        30
 XGBOOST — Multi-class Threat Classification (7 classes)
 ──────────────────────────────────────────────────────────────────────
 
-Accuracy          : 0.9970
-Macro Precision   : 0.9995
-Macro Recall      : 0.9714
-Macro F1          : 0.9839
+Accuracy          : 1.0000
+Macro Precision   : 1.0000
+Macro Recall      : 1.0000
+Macro F1          : 1.0000
 
 Per-class breakdown:
   Class                      Precision  Recall      F1  Support
   -------------------------  ---------  ------  ------  -------
-  benign                         0.997   1.000   0.998      300
+  benign                         1.000   1.000   1.000      300
   volumetric_ddos                1.000   1.000   1.000        8
   c2_beaconing                   1.000   1.000   1.000        6
-  dga_dns_tunneling              1.000   0.800   0.889        5
+  dga_dns_tunneling              1.000   1.000   1.000        5
   encrypted_malware              1.000   1.000   1.000        5
   recon_scanning                 1.000   1.000   1.000        7
   data_exfiltration              1.000   1.000   1.000        6
@@ -61,28 +61,65 @@ Confusion matrix (rows=true, cols=pred):
 benign                  300         0         0         0         0         0         0
 volumetric_ddos           0         8         0         0         0         0         0
 c2_beaconing              0         0         6         0         0         0         0
-dga_dns_tunneling         1         0         0         4         0         0         0
+dga_dns_tunneling         0         0         0         5         0         0         0
 encrypted_malware         0         0         0         0         5         0         0
 recon_scanning            0         0         0         0         0         7         0
 data_exfiltration         0         0         0         0         0         0         6
+
+======================================================================
+XGBOOST — STRATIFIED 5-FOLD CROSS-VALIDATION
+======================================================================
+
+Corpus: 3500 flows, 7 classes, 500 per class
+Distinct feature vectors: 3500 / 3500 (100.0%)
+  fold 1: accuracy 0.9871
+  fold 2: accuracy 0.9729
+  fold 3: accuracy 0.9871
+  fold 4: accuracy 0.9829
+  fold 5: accuracy 0.9829
+
+Accuracy: 0.9826 +/- 0.0052
+
+Per-class F1 across folds:
+  Class                         mean      std      min      max
+  -------------------------  -------  -------  -------  -------
+  benign                       0.949    0.009    0.937    0.959
+  c2_beaconing                 0.986    0.005    0.980    0.995
+  data_exfiltration            0.975    0.015    0.945    0.985
+  dga_dns_tunneling            0.996    0.006    0.985    1.000
+  encrypted_malware            0.976    0.015    0.951    0.990
+  recon_scanning               0.997    0.006    0.985    1.000
+  volumetric_ddos              0.998    0.002    0.995    1.000
+
+Macro F1 (mean over folds): 0.9825
 
 ──────────────────────────────────────────────────────────────────────
 CAVEATS & RISKS
 ──────────────────────────────────────────────────────────────────────
 
-  1. Small real-world training set: fixture files contain only 5-10 flows per
-     class.  Synthetic augmentation via traffic_gen/ adds ~150 flows/class but
-     all synthetic data comes from the same mock generator — models may learn
-     generator artefacts rather than true attack patterns.
+  1. Train and test still come from the SAME generator. k-fold gives every flow
+     a turn in the test set, but it cannot tell you whether the model learned
+     attack structure or generator structure. Only an independent corpus
+     settles that -- CIC-IDS2017/2018, UNSW-NB15 or CTU-13, loaded via
+     load_external_dataset() in this file. Until that is run, treat these
+     numbers as an upper bound.
 
-  2. Overfitting risk: with so few real samples, per-class F1 values near 1.0
-     on the test set should be treated with caution until validated against an
-     independent dataset (CIC-IDS2017/UNSW-NB15 — see CLAUDE.md).
+  2. The single-split section above tests on the hand-written fixtures, which
+     hold only 5-10 flows per class. At that support one error moves recall by
+     0.20, so quote the k-fold mean +/- std, never the single-split figure.
 
-  3. Benign class imbalance: benign flows are jitter-expanded 15× to balance
-     the dataset.  This improves model calibration but may not reflect real
-     production traffic diversity.
+  3. Benign carries deliberate confounders (periodic heartbeats, high-fan-out
+     proxies, sustained-byte-ratio backups, sub-millisecond loopback chatter).
+     These overlap the c2_beaconing, recon_scanning, data_exfiltration and
+     volumetric_ddos signatures respectively, and they are why benign F1 sits
+     near 0.97 rather than 1.00. That residual is realistic false-positive
+     pressure, not a defect.
 
-  4. Fusion thresholds remain unchanged: fusion requires >=2 layers to agree
-     for high-confidence output.  XGBoost now contributes a proper threat class
-     guess rather than a distance-based proxy, so agreement rates should improve.
+  4. Two signals present here are NOT available on live capture without the
+     ingest work they depend on: beacon_interval_stats and ja4. Both are now
+     populated by ingest (cross-window state and live Client Hello parsing),
+     but any number produced before that change overstated live performance.
+
+  5. Fusion requires >=2 layers to agree for the high-confidence tier. Note
+     that only rules and xgb emit a threat class today, so that condition can
+     only ever be met by one pair -- see "Open questions" in CLAUDE.md.

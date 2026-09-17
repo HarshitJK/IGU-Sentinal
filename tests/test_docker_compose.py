@@ -3,18 +3,27 @@ import subprocess
 import time
 import json
 from pathlib import Path
+
+from tests.conftest import compose_command
 import requests
 import yaml
 
 
-def run_command(cmd, timeout=60):
-    """Run a shell command and return stdout, stderr, returncode."""
+def run_command(cmd, timeout=60, cwd=None):
+    """Run a command (list or str) and return stdout, stderr, returncode.
+
+    Accepts either a list of strings (preferred — safe with paths that contain
+    spaces) or a shell string for backward compatibility.  The ``cwd``
+    parameter is forwarded directly to subprocess.run so callers no longer
+    need to prepend ``cd <dir> && ``.
+    """
     result = subprocess.run(
         cmd,
-        shell=True,
+        shell=isinstance(cmd, str),
         capture_output=True,
         text=True,
-        timeout=timeout
+        timeout=timeout,
+        cwd=cwd,
     )
     return result.stdout.strip(), result.stderr.strip(), result.returncode
 
@@ -25,8 +34,9 @@ def docker_compose_up():
     compose_file = root_dir / "docker-compose.yml"
 
     stdout, stderr, rc = run_command(
-        f"cd {root_dir} && docker-compose -f {compose_file} up -d",
-        timeout=120
+        [*compose_command().split(), "-f", str(compose_file), "up", "-d"],
+        timeout=120,
+        cwd=str(root_dir),
     )
 
     if rc != 0:
@@ -43,8 +53,9 @@ def docker_compose_down():
     compose_file = root_dir / "docker-compose.yml"
 
     stdout, stderr, rc = run_command(
-        f"cd {root_dir} && docker-compose -f {compose_file} down -v",
-        timeout=60
+        [*compose_command().split(), "-f", str(compose_file), "down", "-v"],
+        timeout=60,
+        cwd=str(root_dir),
     )
 
     if rc != 0:

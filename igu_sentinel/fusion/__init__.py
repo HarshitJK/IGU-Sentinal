@@ -1,17 +1,43 @@
 """Cross-layer fusion: Platt calibration + correlation logic."""
+import logging
 from datetime import datetime
 from igu_sentinel.schemas import LayerScore, Alert
 
+log = logging.getLogger(__name__)
 
 # A layer may explicitly vote "benign"; that is NOT an accusation and must never
 # be treated as a threat-class vote in the consensus.
 BENIGN_LABEL = "benign"
 
-# Minimum fused confidence for an alert to be worth surfacing to an analyst.
-# Combined with the existing single-layer downgrade (x0.7), this suppresses
-# "one layer twitched on quiet traffic" without touching the >=2-layer
-# consensus logic that gates the high-confidence tier.
+# Zero trust at the data level (CLAUDE.md): fusion does not assume an upstream
+# detector emitted a class the Alert schema accepts. A stale model artifact or a
+# new detector can emit anything; an unrecognised label reaching Alert() raises
+# ValidationError per flow, taking down the scoring path rather than degrading.
+VALID_THREAT_CLASSES = frozenset({
+    "volumetric_ddos",
+    "c2_beaconing",
+    "dga_dns_tunneling",
+    "encrypted_malware",
+    "recon_scanning",
+    "data_exfiltration",
+})
+
+# Confidence tiers. Reported in `evidence`, never multiplied into the score.
+HIGH_CONFIDENCE_TIER = "high"          # >=2 independent layers named the same class
+ADVISORY_TIER = "advisory"             # exactly one layer named a class
+UNCORROBORATED_TIER = "uncorroborated"  # no layer named a class
+
+# Minimum calibrated probability for an alert to be worth surfacing.
+#
+# Retuned when the tier multipliers were removed: a single-layer detection used
+# to be scaled by 0.7 before meeting this threshold, so the effective bar for
+# one layer was ~0.71 and for two layers ~0.45. Those effective bars are now
+# stated directly, per tier, instead of being an artefact of arithmetic.
 ALERT_CONFIDENCE_THRESHOLD = 0.5
+ADVISORY_CONFIDENCE_THRESHOLD = 0.70
+
+# Minimum calibrated probability for an unsupervised layer to corroborate or alert (R7, R8)
+UNSUPERVISED_CORROBORATION_THRESHOLD = 0.75
 
 # Marker added when no layer named any threat class at all.
 NO_CONSENSUS_EVIDENCE = "no_layer_named_a_threat_class"
@@ -26,12 +52,12 @@ def is_actionable_alert(scores: list[LayerScore], alert: Alert) -> bool:
     every observed flow becomes an alert (and, with no threat vote, inherits the
     placeholder class), which is exactly the idle-traffic false-positive flood.
 
-    An alert is actionable only when BOTH hold:
-      1. At least one layer actually named a threat class (not None, not benign).
-      2. The fused confidence clears ALERT_CONFIDENCE_THRESHOLD.
-
-    This does not alter the >=2-layer consensus mechanism — it only decides
-    whether the already-fused verdict is surfaced.
+    An alert is actionable when:
+      1. At least one layer named a threat class (or an unclassified anomaly was
+         surfaced by strong unsupervised layers per R8).
+      2. The fused confidence clears the applicable threshold (ALERT_CONFIDENCE_THRESHOLD
+         for corroborated alerts, ADVISORY_CONFIDENCE_THRESHOLD for single-layer
+         or unclassified anomaly alerts).
 
     Args:
         scores: The LayerScores that produced this alert.
@@ -40,12 +66,27 @@ def is_actionable_alert(scores: list[LayerScore], alert: Alert) -> bool:
     Returns:
         True if the alert should be logged/broadcast, False to suppress it.
     """
-    named_threat = any(
-        s.threat_class_guess and s.threat_class_guess != BENIGN_LABEL for s in scores
-    )
-    if not named_threat:
+    named = [
+        s.threat_class_guess for s in scores
+        if s.threat_class_guess and s.threat_class_guess != BENIGN_LABEL
+    ]
+    if not named:
+        # R8: Allow strong unsupervised anomalies to surface at advisory threshold
+        if "unclassified_anomaly=true" in alert.evidence:
+            return alert.confidence_score >= ADVISORY_CONFIDENCE_THRESHOLD
         return False
-    return alert.confidence_score >= ALERT_CONFIDENCE_THRESHOLD
+
+    # A single-layer detection has no corroboration, so it must clear a higher
+    # bar than a cross-layer one. Corroboration includes both supervised agreement
+    # and strong unsupervised corroboration (R7).
+    corroborated = len([c for c in set(named) if named.count(c) >= 2]) > 0
+    if not corroborated and any("corroborates=" in e for e in alert.evidence):
+        corroborated = True
+
+    threshold = (
+        ALERT_CONFIDENCE_THRESHOLD if corroborated else ADVISORY_CONFIDENCE_THRESHOLD
+    )
+    return alert.confidence_score >= threshold
 
 
 def fuse_layers(scores: list[LayerScore]) -> Alert:
@@ -84,12 +125,38 @@ def fuse_layers(scores: list[LayerScore]) -> Alert:
         layer_probabilities.append(score.calibrated_probability)
         # An explicit "benign" verdict is not an accusation — it must not be
         # counted as a threat-class vote in the consensus below.
-        if score.threat_class_guess and score.threat_class_guess != BENIGN_LABEL:
-            if score.threat_class_guess not in threat_guesses:
-                threat_guesses[score.threat_class_guess] = []
-            threat_guesses[score.threat_class_guess].append(score.calibrated_probability)
+        guess = score.threat_class_guess
+        if guess and guess != BENIGN_LABEL:
+            if guess in VALID_THREAT_CLASSES:
+                if guess not in threat_guesses:
+                    threat_guesses[guess] = []
+                threat_guesses[guess].append(score.calibrated_probability)
+            else:
+                # Drop the vote, keep the layer's evidence: the observation may
+                # still be useful to an analyst even when the label is not one
+                # the Alert schema accepts.
+                log.warning(
+                    "fusion: layer %r proposed out-of-schema class %r — ignoring vote",
+                    score.layer_name, guess,
+                )
         if score.evidence:
             all_evidence.extend(score.evidence)
+
+    # R7: Cross-layer corroboration from unsupervised layers
+    # If exactly one candidate threat class was proposed by supervised layers, allow
+    # high-confidence unsupervised layers (calibrated probability >= 0.75) to corroborate
+    named_candidates = list(threat_guesses.keys())
+    if len(named_candidates) == 1:
+        candidate = named_candidates[0]
+        for score in scores:
+            if (
+                score.threat_class_guess is None
+                and score.calibrated_probability >= UNSUPERVISED_CORROBORATION_THRESHOLD
+            ):
+                threat_guesses[candidate].append(score.calibrated_probability)
+                all_evidence.append(
+                    f"{score.layer_name}_corroborates={score.calibrated_probability:.3f}"
+                )
 
     # Determine consensus threat class
     # Pick the one with most layer agreement, weighted by confidence
@@ -103,37 +170,60 @@ def fuse_layers(scores: list[LayerScore]) -> Alert:
         threat_class = sorted_guesses[0][0]
         agreement_count = len(sorted_guesses[0][1])
     else:
-        # No layer named a threat class. The Alert schema requires one of the six
-        # mandated classes, so a placeholder is unavoidable here — but this alert
-        # is NOT actionable and is_actionable_alert() drops it before it reaches
-        # the log or the dashboard. The marker makes that visible if it is ever
-        # inspected directly. (Previously this silently mislabelled quiet traffic
-        # as volumetric_ddos.)
-        threat_class = "volumetric_ddos"  # placeholder only — suppressed downstream
-        agreement_count = 0
-        all_evidence.append(NO_CONSENSUS_EVIDENCE)
+        # R8: Strong unclassified anomalies from unsupervised layers
+        strong_unsupervised = [
+            s for s in scores
+            if s.threat_class_guess is None
+            and s.calibrated_probability >= UNSUPERVISED_CORROBORATION_THRESHOLD
+        ]
+        if strong_unsupervised:
+            # Route to nearest plausible class by evidence cues to keep schema valid
+            combined_evidence_str = " ".join(all_evidence).lower()
+            if any(k in combined_evidence_str for k in ("fanout", "port", "scan", "targets")):
+                threat_class = "recon_scanning"
+            elif any(k in combined_evidence_str for k in ("byte", "exfil", "upload", "outbound")):
+                threat_class = "data_exfiltration"
+            elif any(k in combined_evidence_str for k in ("dns", "tunnel", "entropy", "query")):
+                threat_class = "dga_dns_tunneling"
+            elif any(k in combined_evidence_str for k in ("rate", "packet_count", "pps", "flood")):
+                threat_class = "volumetric_ddos"
+            else:
+                threat_class = "recon_scanning"
+            agreement_count = len(strong_unsupervised)
+            all_evidence.append("unclassified_anomaly=true")
+            all_evidence.append(f"unsupervised_layers_alerted={len(strong_unsupervised)}")
+        else:
+            threat_class = "volumetric_ddos"  # placeholder only — suppressed downstream
+            agreement_count = 0
+            all_evidence.append(NO_CONSENSUS_EVIDENCE)
 
     # Compute fused confidence score
     # Base: average calibrated probability across all layers
     avg_probability = sum(layer_probabilities) / len(layer_probabilities)
 
-    # Adjust based on layer agreement
-    # >=2 layers agreeing: boost confidence
-    # 1 layer: downgrade confidence (advisory tier)
-    if agreement_count >= 2:
-        # High-confidence tier: multiple layers agree
-        # Boost toward upper range
-        fused_confidence = min(0.95, avg_probability * 1.1)
-    elif agreement_count == 1:
-        # Lower-confidence (advisory): only one layer detected threat
-        # Downgrade to lower range
-        fused_confidence = avg_probability * 0.7
-    else:
-        # No specific threat class guess, use base average
-        fused_confidence = avg_probability * 0.6
+    # confidence_score stays a CALIBRATED PROBABILITY — it is not rescaled by
+    # tier.
+    #
+    # It used to be multiplied by 1.1 (>=2 layers), 0.7 (1 layer) or 0.6 (none).
+    # Those factors are tier weighting, and they destroy calibration: after a
+    # x1.1 a reported 0.8 no longer means "80% of flows scored this way are
+    # threats", which is exactly what CLAUDE.md says the field means. The tier
+    # is real information, so it is reported alongside rather than multiplied in.
+    fused_confidence = max(0.0, min(1.0, avg_probability))
 
-    # Ensure confidence is in valid range
-    fused_confidence = max(0.0, min(1.0, fused_confidence))
+    if "unclassified_anomaly=true" in all_evidence:
+        tier = ADVISORY_TIER
+    else:
+        tier = (
+            HIGH_CONFIDENCE_TIER if agreement_count >= 2
+            else ADVISORY_TIER if agreement_count == 1
+            else UNCORROBORATED_TIER
+        )
+    # The Alert schema is PS-fixed, so the tier cannot become a field. Putting
+    # it in evidence keeps the schema exact while preserving the information
+    # that the multipliers used to encode (lossily).
+    all_evidence.append(f"tier={tier}")
+    all_evidence.append(f"corroborating_layers={agreement_count}")
 
     # Build alert
     alert = Alert(

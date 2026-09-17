@@ -13,7 +13,7 @@ ROUTING_TABLE="diode"
 
 # 1. Stop containers (if running)
 echo "Stopping router and diode containers..."
-docker-compose stop router diode || true
+$(docker compose version >/dev/null 2>&1 && echo "docker compose" || echo docker-compose) stop router diode || true
 echo "✓ Containers stopped (or were not running)"
 
 # 2. Delete routing rules (idempotent: || true if not present)

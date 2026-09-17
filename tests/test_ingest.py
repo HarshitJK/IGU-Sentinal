@@ -1,5 +1,6 @@
 """Test tshark-based flow ingest and feature extraction."""
 import json
+import pytest
 import subprocess
 import struct
 import time
@@ -378,3 +379,149 @@ def test_extract_ja4_from_pcap_tls(tmp_path):
     assert len(tls_flow.ja4) == 36
     assert tls_flow.ja4.startswith("t13d0501h2_")
     print(f"✓ Successfully extracted JA4: {tls_flow.ja4}")
+
+
+# ── Cross-window behavioural state ────────────────────────────────────────────
+
+def _tls_client_hello_packet(src_ip="10.0.0.5", dst_ip="10.0.0.9", ts="1700000000.0"):
+    """A tshark -T json packet carrying a TLS Client Hello."""
+    return {
+        "_source": {"layers": {
+            "frame": {"frame.len": "517", "frame.time_epoch": ts},
+            "ip": {"ip.src": src_ip, "ip.dst": dst_ip, "ip.ttl": "64"},
+            "tcp": {"tcp.srcport": "51000", "tcp.dstport": "443"},
+            "tls": {"tls.record": {
+                "tls.handshake.type": "1",
+                "tls.handshake.version": "0x0303",
+                "tls.handshake.ciphersuite": ["0x1301", "0x1302", "0xc02f"],
+                "tls.handshake.extension.type": ["43", "51", "13"],
+                "tls.handshake.extensions_server_name": "example.com",
+                "tls.handshake.extensions_alpn_str": "h2",
+                "tls.handshake.extensions.supported_version": ["0x0304"],
+            }},
+        }}
+    }
+
+
+def _plain_packet(src_ip, dst_ip, dst_port, ts):
+    return {
+        "_source": {"layers": {
+            "frame": {"frame.len": "120", "frame.time_epoch": str(ts)},
+            "ip": {"ip.src": src_ip, "ip.dst": dst_ip, "ip.ttl": "64"},
+            "tcp": {"tcp.srcport": "40000", "tcp.dstport": str(dst_port)},
+        }}
+    }
+
+
+def test_beacon_interval_stats_populated_across_windows():
+    """Repeated callbacks must produce beacon_interval_stats.
+
+    This field was hardcoded None in _build_flow_records, so the c2_beaconing
+    rule — which is gated on `if flow.beacon_interval_stats` — could never fire
+    on real captured traffic.
+    """
+    from igu_sentinel.ingest import _build_flow_records, reset_flow_state
+
+    reset_flow_state()
+    stats = None
+    # Six windows, one callback each, exactly 30s apart.
+    for i in range(6):
+        pkt = _plain_packet("10.1.1.1", "10.1.1.2", 443, 1700000000.0 + i * 30.0)
+        flows = _build_flow_records([pkt])
+        assert len(flows) == 1
+        stats = flows[0].beacon_interval_stats
+
+    assert stats is not None, "beacon stats must be populated after repeated callbacks"
+    assert stats["mean"] == pytest.approx(30.0, abs=0.01)
+    assert stats["std"] == pytest.approx(0.0, abs=0.01), "a metronomic beacon has ~0 jitter"
+    print(f"✓ test_beacon_interval_stats_populated_across_windows passed ({stats})")
+
+
+def test_beacon_stats_withheld_until_enough_callbacks():
+    """One packet is not a beacon — no interval may be claimed from it."""
+    from igu_sentinel.ingest import _build_flow_records, reset_flow_state
+
+    reset_flow_state()
+    pkt = _plain_packet("10.2.2.1", "10.2.2.2", 443, 1700000000.0)
+    assert _build_flow_records([pkt])[0].beacon_interval_stats is None
+    print("✓ test_beacon_stats_withheld_until_enough_callbacks passed")
+
+
+def test_fanout_accumulates_across_windows():
+    """A scanner pacing under the per-window threshold must still be counted.
+
+    Fan-out was computed only within a single 120ms window, so probing 14
+    targets per window — roughly 116/second — never crossed SCAN_FANOUT_THRESHOLD.
+    """
+    from igu_sentinel.ingest import _build_flow_records, reset_flow_state
+    from igu_sentinel.detect.rules import SCAN_FANOUT_THRESHOLD
+
+    reset_flow_state()
+    max_seen = 0
+    # 10 windows x 5 fresh targets each: never more than 5 in any one window,
+    # which is far below the threshold.
+    for w in range(10):
+        pkts = [
+            _plain_packet("10.3.3.1", f"10.3.3.{100 + w * 5 + i}", 80, 1700000000.0 + w)
+            for i in range(5)
+        ]
+        for f in _build_flow_records(pkts):
+            max_seen = max(max_seen, f.fanout_count or 0)
+
+    assert max_seen >= SCAN_FANOUT_THRESHOLD, (
+        f"paced scan must still reach the fan-out threshold; peak was {max_seen}"
+    )
+    print(f"✓ test_fanout_accumulates_across_windows passed (peak fanout {max_seen})")
+
+
+def test_flow_state_is_memory_bounded():
+    """A spoofed-source flood must not grow the state table without limit."""
+    from igu_sentinel.ingest import (
+        _build_flow_records, reset_flow_state,
+        _MAX_TRACKED_SOURCES, _MAX_TRACKED_FLOWS,
+        _source_targets, _flow_arrivals,
+    )
+
+    reset_flow_state()
+    for i in range(_MAX_TRACKED_SOURCES + 500):
+        _build_flow_records([_plain_packet(f"10.{i // 65536 % 256}.{i // 256 % 256}.{i % 256}",
+                                           "10.9.9.9", 80, 1700000000.0 + i)])
+
+    assert len(_source_targets) <= _MAX_TRACKED_SOURCES
+    assert len(_flow_arrivals) <= _MAX_TRACKED_FLOWS
+    print(f"✓ test_flow_state_is_memory_bounded passed "
+          f"({len(_source_targets)} sources, {len(_flow_arrivals)} flows retained)")
+
+
+def test_ja4_extracted_from_live_packets():
+    """The live path must produce JA4, not leave it None.
+
+    extract_flows_from_interface() passed ja4_map={} unconditionally, so every
+    live flow had ja4=None — leaving model features 12-15 always zero and the
+    JA4 rules dead, despite JA4 being the mandated primary signal for
+    encrypted_malware.
+    """
+    from igu_sentinel.ingest import _ja4_from_packets, _build_flow_records, reset_flow_state
+
+    reset_flow_state()
+    packets = [_tls_client_hello_packet()]
+    ja4_map = _ja4_from_packets(packets)
+
+    assert ja4_map, "a Client Hello must yield a JA4 fingerprint"
+    ja4 = next(iter(ja4_map.values()))
+    assert len(ja4.split("_")) == 3, f"JA4 has three parts, got {ja4!r}"
+    assert ja4.startswith("t13d"), f"TCP + TLS1.3 + domain SNI expected, got {ja4!r}"
+
+    flows = _build_flow_records(packets, ja4_map=ja4_map)
+    assert flows[0].ja4 == ja4, "the fingerprint must reach the FlowRecord"
+    print(f"✓ test_ja4_extracted_from_live_packets passed ({ja4})")
+
+
+def test_live_tshark_command_requests_tls_metadata():
+    """Live capture must ask tshark for the TLS tree, or JA4 is unobtainable."""
+    from igu_sentinel.ingest import _live_tshark_command
+
+    cmd = _live_tshark_command("eth0")
+    assert "-J" in cmd, "tshark must be asked to include the TLS protocol tree"
+    assert any("tls" in part for part in cmd)
+    print("✓ test_live_tshark_command_requests_tls_metadata passed")

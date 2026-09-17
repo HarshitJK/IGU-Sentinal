@@ -1,0 +1,65 @@
+# Optional macvlan host-routing sandbox overlay.
+#
+# Kept OUT of docker-compose.yml because macvlan networks must name a real
+# parent interface on the host. The previous hardcoded `parent: wlp8s0` made
+# `docker compose up` fail at network-creation time on every machine that did
+# not happen to have a wireless interface by that name — which took the whole
+# stack down, not just the sandbox.
+#
+# Usage (set the parent to a real interface on your host):
+#   DIODE_MACVLAN_PARENT=eth0 docker compose \
+#       -f docker-compose.yml -f docker-compose.macvlan.yml up -d
+#
+# macvlan also requires a Linux host; it is not supported by Docker Desktop on
+# macOS or Windows. On those hosts use the base compose file only — the diode's
+# iptables enforcement and the prod/enclave separation do not depend on macvlan.
+
+services:
+  # Gateway endpoint on both macvlan segments. Carries no application logic;
+  # the host routes traffic through it during sandbox experiments.
+  router:
+    image: alpine:3.20
+    networks:
+      macvlan-prod:
+        ipv4_address: 192.168.2.254
+      macvlan-enclave:
+        ipv4_address: 192.168.3.254
+    container_name: igusentinel-router
+    cap_add:
+      - NET_ADMIN
+    entrypoint: /bin/sh
+    command:
+      - -eu
+      - -c
+      - |
+        echo 'Router: gateway endpoint online (prod 192.168.2.254 / enclave 192.168.3.254)'
+        exec sleep infinity
+    restart: unless-stopped
+
+  diode:
+    networks:
+      - prod-net
+      - enclave-net
+      - macvlan-prod
+      - macvlan-enclave
+
+networks:
+  macvlan-prod:
+    driver: macvlan
+    driver_opts:
+      parent: ${DIODE_MACVLAN_PARENT:?set DIODE_MACVLAN_PARENT to a host interface, e.g. eth0}
+    ipam:
+      config:
+        - subnet: 192.168.2.0/24
+          gateway: 192.168.2.1
+    name: macvlan-prod
+
+  macvlan-enclave:
+    driver: macvlan
+    driver_opts:
+      parent: ${DIODE_MACVLAN_PARENT:?set DIODE_MACVLAN_PARENT to a host interface, e.g. eth0}
+    ipam:
+      config:
+        - subnet: 192.168.3.0/24
+          gateway: 192.168.3.1
+    name: macvlan-enclave

@@ -517,9 +517,19 @@
 
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/ws/alerts`;
+            // Read the API token from a meta tag injected by the server.
+            // When IGU_API_TOKEN is set, the /dashboard endpoint template-expands
+            // this tag so the WebSocket handshake carries the same credential.
+            // Browsers cannot set custom headers on a WebSocket connection, so
+            // the token is passed as a query parameter (the backend reads
+            // websocket.query_params.get("token")).
+            const tokenMeta = document.querySelector('meta[name="iguToken"]');
+            const token = tokenMeta ? tokenMeta.getAttribute('content') : '';
+            const wsBase = `${protocol}//${window.location.host}/ws/alerts`;
+            const wsUrl = token ? `${wsBase}?token=${encodeURIComponent(token)}` : wsBase;
 
             const ws = new WebSocket(wsUrl);
+
 
             ws.onopen = () => {
                 document.getElementById('connectionStatus').textContent = '✓ Connected';

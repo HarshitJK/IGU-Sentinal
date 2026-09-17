@@ -96,3 +96,86 @@ Vary source-IP mode (`hping3 --rand-source` or a fixed spoof pool), rate (`-i`),
 - Write the test first, against the data contracts above, then write the implementation to pass it.
 - Do not invent new modules, folders, or abstractions beyond what's listed here. If something seems missing, add a note under a new "## Open questions" section at the bottom of this file rather than improvising silently.
 - Keep changes scoped to the current task only. Commit after each completed task.
+
+## Open questions
+
+Raised during the 2026-09-17 security and correctness audit. Recorded here rather
+than improvised silently, per the working agreement above.
+
+### Additions made that the module layout does not list
+These were added because a CLAUDE.md requirement elsewhere in this file demanded
+them and no listed module provided one. Confirm or relocate:
+
+1. **`igu_sentinel/benchmark/`** — "Benchmarking / evaluation" requires *"a
+   dedicated benchmark harness module [that] must measure and log sustained
+   flows/sec and end-to-end latency"* and calls it graded, but the module layout
+   has no entry for it. Only `tests/test_benchmark.py` existed. Added as a
+   module; building it revealed the pipeline was running at ~112 flows/sec.
+2. **Batch entry points** `score_isoforest_batch()` / `predict_xgb_batch()` in
+   the existing detect modules. The stated contract is `FlowRecord -> LayerScore`
+   and that is unchanged — the per-flow functions remain and now delegate to the
+   batch ones. The batch form exists because per-call model overhead, not
+   per-row work, was capping throughput ~100x below what the layers can do.
+3. **`docker-compose.macvlan.yml`** — the macvlan sandbox pinned
+   `parent: wlp8s0`, a specific machine's wireless interface, so `compose up`
+   failed at network creation everywhere else and took the whole stack with it.
+   Split into an opt-in overlay.
+
+### Unresolved design questions
+
+4. **Cross-layer corroboration is effectively two layers, not four.** Fusion
+   grants the high-confidence tier when >=2 layers name the *same* threat class,
+   but only `rules` and `xgb` ever set `threat_class_guess` — `stats` and
+   `isoforest` are unsupervised and always return `None`. So the >=2 agreement
+   condition can only ever be satisfied by exactly one pair, and the two
+   statistical layers can never contribute to a high-confidence verdict. Should
+   they vote (e.g. an anomaly score above a threshold corroborating whichever
+   class the supervised layers propose), or is the current design intentional?
+
+5. **A strong anomaly with no class is silently dropped.** `is_actionable_alert`
+   requires that some layer named a threat class. A flow that `isoforest` and
+   `stats` both find wildly anomalous, but that neither `rules` nor `xgb`
+   recognises, produces no alert at all — which is precisely the novel/zero-day
+   case the unsupervised layer exists to catch. The `Alert` schema is PS-fixed
+   to six classes with no "unknown", so surfacing it needs a decision: map to
+   the closest class, or accept that unclassifiable anomalies are not reported?
+
+6. **`confidence_score` is documented as a calibrated probability but is not
+   one.** Fusion multiplies the averaged probability by 1.1 for the agreement
+   tier and by 0.7/0.6 otherwise. Those factors are tier weighting, and they
+   destroy calibration — a "0.8" no longer means 80% of such flows are threats.
+   Either drop the multipliers and express tiers separately, or stop describing
+   the field as calibrated.
+
+7. **Platt scaling is not fitted.** CLAUDE.md requires calibration *"fit on
+   held-out labeled data"*. `rules` and `stats` both hardcode
+   `1/(1+exp(-5*(s-0.25)))`; only `isoforest` fits its midpoint, and only from
+   the benign training distribution. A held-out labeled split exists in
+   `eval.py` and could fit real Platt coefficients per layer.
+
+8. **The traffic generator emits constant vectors, so the reported metrics are
+   not meaningful.** `mock.generate()` produces identical features for every
+   flow of a class (only `flow_id`, `src_port` and `timestamp` vary; DGA varies
+   two fields on a 5-cycle). Every "generator" — `ddos.py`, `scanning.py`,
+   `exfiltration.py`, `beaconing.py`, `dns_tunneling.py`,
+   `encrypted_malware.py` — delegates to it; none invokes hping3, iperf3, nmap,
+   Slowloris, dnscat2 or TRex as their docstrings describe. XGBoost's 99.7%
+   accuracy and 1.000 per-class F1 in `eval_report.txt` reflect memorising six
+   points in feature space. This directly contradicts the warning already in
+   this file — *"never rely on one tool's default parameters ... or the model
+   learns the tool's fingerprint instead of the attack pattern"* — and the test
+   split is 5-8 flows per attack class, far too small to support any figure.
+   Needs either real tool invocation or, at minimum, per-flow parameter jitter.
+
+9. **Model artifacts are unversioned relative to the repo.** `models/` holds 46
+   files; the loader takes the highest version number, which is currently
+   `isoforest_v18.pkl` / `xgb_v14.json` — both untracked in git. A fresh clone
+   loads `v9`, so a clone does not reproduce the reported numbers. Should the
+   serving version be pinned explicitly (a `models/CURRENT` pointer) rather than
+   inferred from a filename sort?
+
+10. **`joblib.load()` on model artifacts unpickles, which executes arbitrary
+    code.** `models/` is therefore a trust boundary equivalent to executable
+    code. Path containment and bundle-shape validation are now enforced, but
+    anyone who can write to `models/` still achieves code execution in the
+    service. A signed-manifest or hash-allowlist scheme would close this.

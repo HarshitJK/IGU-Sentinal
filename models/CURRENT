@@ -1,0 +1,7 @@
+# Declares which model artifact each detector serves.
+# Without this the loader picked the highest version number, which silently
+# served xgb_v14 -- a degraded 5-class model missing recon_scanning and
+# data_exfiltration entirely (33.2% accuracy vs 100% for the 7-class v13).
+# An attacker who can write models/ could also just drop in xgb_v999.json.
+isoforest = isoforest_v18.pkl
+xgb = xgb_v15.json

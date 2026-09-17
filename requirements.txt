@@ -1,11 +1,36 @@
-pydantic>=2.0.0
-pytest>=7.0.0
-fastapi>=0.100.0
-uvicorn>=0.23.0
-websockets>=12.0
-httpx>=0.28.0
-numpy>=1.20.0
-scikit-learn>=1.0.0
-xgboost>=1.7.0
-pyyaml>=6.0
-requests>=2.31.0
+# Runtime + test dependencies.
+#
+# Every constraint carries an upper bound. The previous file used bare `>=`
+# throughout, so `pip install -r` resolved to whatever was newest on the day it
+# ran — two people, or a rebuild a month apart, got different dependency sets
+# from the same commit. For a system whose evaluation numbers must be
+# reproducible, that is a correctness problem, not a style one.
+#
+# Bounds are per-major-version, so patch and minor updates still flow in.
+# Versions below are the ones this tree is tested against.
+
+# ── API / service ────────────────────────────────────────────────────────────
+fastapi>=0.100.0,<1.0.0
+uvicorn>=0.23.0,<1.0.0
+websockets>=12.0,<18.0
+pydantic>=2.0.0,<3.0.0
+
+# ── ML / numerics ────────────────────────────────────────────────────────────
+numpy>=1.20.0,<3.0.0
+scikit-learn>=1.0.0,<2.0.0
+xgboost>=1.7.0,<4.0.0
+# Direct dependency: detect/isoforest.py imports joblib to persist and load
+# model bundles. It was previously absent here and only present transitively via
+# scikit-learn — so the pipeline's model persistence depended on another
+# package's dependency graph not changing.
+joblib>=1.2.0,<2.0.0
+
+# ── Config / IO ──────────────────────────────────────────────────────────────
+pyyaml>=6.0,<7.0
+# Used by the container HEALTHCHECK in Dockerfile.
+requests>=2.31.0,<3.0.0
+
+# ── Test ─────────────────────────────────────────────────────────────────────
+pytest>=7.0.0,<10.0.0
+# Required by fastapi.testclient (TestClient) in tests/test_api.py.
+httpx>=0.28.0,<1.0.0

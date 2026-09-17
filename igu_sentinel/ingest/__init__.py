@@ -16,12 +16,12 @@ import threading
 import time
 import hashlib
 import struct
-from collections import defaultdict
+from collections import defaultdict, deque, OrderedDict
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Iterable, Iterator, Optional
 from statistics import mean, stdev
 from igu_sentinel.schemas import FlowRecord
-from igu_sentinel.ingest.ja4 import parse_tshark_fields_line
+from igu_sentinel.ingest.ja4 import compute_ja4, parse_tshark_fields_line
 
 
 # Fixed 120ms capture window (locked in CLAUDE.md — deliberately NOT adaptive).
@@ -31,6 +31,105 @@ DEFAULT_WINDOW_MS = 120
 # A bad interface name or missing capture permission makes tshark exit within
 # this grace period, so we can surface a clear error instead of hanging.
 _LIVE_STARTUP_GRACE_S = 0.6
+
+
+# ── Cross-window flow state ───────────────────────────────────────────────────
+# The 120ms capture window is fixed and deliberately not adaptive (CLAUDE.md).
+# But three of the six mandated threat classes are DEFINED by behaviour over
+# minutes, not milliseconds:
+#   * c2_beaconing     - a callback every 30s is one packet per 250 windows
+#   * recon_scanning   - a scanner pacing 14 targets per window never crosses
+#                        the fan-out threshold, though it sweeps thousands/min
+#   * data_exfiltration- a slow trickle looks like an idle session in any single
+#                        window
+# A stateless pipeline cannot see any of them. This table gives the DETECTORS
+# memory without touching the capture window: the window stays fixed at 120ms,
+# and these aggregates are layered on top.
+#
+# Memory is bounded on both axes - entries per key and total keys - with LRU
+# eviction, so a flood cannot grow it without limit.
+
+# How far back behavioural aggregates look.
+FLOW_STATE_HORIZON_S = 300.0
+# Arrival timestamps retained per flow (enough for a stable interval estimate).
+_MAX_ARRIVALS_PER_FLOW = 64
+# Hard cap on tracked flows / sources. A SYN flood with spoofed sources creates
+# a new key per packet, so this bound is load-bearing, not decorative.
+_MAX_TRACKED_FLOWS = 20000
+_MAX_TRACKED_SOURCES = 5000
+
+_state_lock = threading.Lock()
+# flow_key -> deque of arrival timestamps
+_flow_arrivals: "OrderedDict[Tuple, Any]" = OrderedDict()
+# src_ip -> {(dst_ip, dst_port): last_seen_timestamp}
+_source_targets: "OrderedDict[str, Dict[Tuple[str, int], float]]" = OrderedDict()
+
+
+def reset_flow_state() -> None:
+    """Clear all cross-window state (tests, and between capture sessions)."""
+    with _state_lock:
+        _flow_arrivals.clear()
+        _source_targets.clear()
+
+
+def _record_arrival(flow_key: Tuple, ts: float) -> Optional[Dict[str, float]]:
+    """Record a flow's arrival and return beacon interval stats once known.
+
+    Returns None until enough callbacks have been seen to estimate an interval,
+    so a flow is never described as beaconing on the strength of one packet.
+    """
+    with _state_lock:
+        arrivals = _flow_arrivals.get(flow_key)
+        if arrivals is None:
+            arrivals = deque(maxlen=_MAX_ARRIVALS_PER_FLOW)
+            _flow_arrivals[flow_key] = arrivals
+        else:
+            _flow_arrivals.move_to_end(flow_key)
+        arrivals.append(ts)
+        while len(_flow_arrivals) > _MAX_TRACKED_FLOWS:
+            _flow_arrivals.popitem(last=False)   # evict least recently seen
+        snapshot = list(arrivals)
+
+    # Need at least 3 gaps (4 callbacks) before an interval means anything.
+    if len(snapshot) < 4:
+        return None
+    cutoff = snapshot[-1] - FLOW_STATE_HORIZON_S
+    recent = [t for t in snapshot if t >= cutoff]
+    if len(recent) < 4:
+        return None
+    gaps = [b - a for a, b in zip(recent, recent[1:]) if b > a]
+    if len(gaps) < 3:
+        return None
+    return {
+        "mean": float(mean(gaps)),
+        "std": float(stdev(gaps)) if len(gaps) > 1 else 0.0,
+    }
+
+
+def _record_target(src_ip: str, dst_ip: str, dst_port: int, ts: float) -> int:
+    """Record a contacted target and return the source's decayed fan-out.
+
+    Fan-out was previously counted only within a single 120ms window, so an
+    attacker probing 14 targets per window - a leisurely ~116/second - stayed
+    under the threshold forever. Counting over a decaying horizon makes pacing
+    stop working as an evasion.
+    """
+    with _state_lock:
+        targets = _source_targets.get(src_ip)
+        if targets is None:
+            targets = {}
+            _source_targets[src_ip] = targets
+        else:
+            _source_targets.move_to_end(src_ip)
+        targets[(dst_ip, dst_port)] = ts
+
+        cutoff = ts - FLOW_STATE_HORIZON_S
+        for key in [k for k, seen in targets.items() if seen < cutoff]:
+            del targets[key]
+
+        while len(_source_targets) > _MAX_TRACKED_SOURCES:
+            _source_targets.popitem(last=False)
+        return len(targets)
 
 
 class LiveCaptureError(RuntimeError):
@@ -397,22 +496,48 @@ def _build_flow_records(
         all_payloads = "".join([p["payload"] for p in packets_info])
         entropy = _extract_payload_entropy(all_payloads)
 
-        # Byte ratio (ratio of data bytes to total frame bytes)
+        # Byte ratio: payload bytes over total frame bytes.
+        #
+        # When no payload is extractable this used to default to 0.7 — a value
+        # with no derivation that the model could not tell apart from a measured
+        # one. That is common, not rare: encrypted traffic and protocols tshark
+        # dissects (DNS, TLS records) frequently yield no raw payload, so a
+        # meaningful fraction of real flows carried a fabricated mid-range value
+        # feeding feature 7 and three rules.
+        #
+        # Measuring 0.0 is the truthful answer — "we observed no payload bytes"
+        # — and byte_ratio_measured records whether the figure is an observation
+        # or an absence, so absence is itself available as a signal.
         total_bytes = sum(packet_sizes)
-        byte_ratio = 0.7  # Default for valid traffic
-        if total_bytes > 0:
-            byte_ratio = min(1.0, sum([len(p["payload"]) // 2 for p in packets_info]) / total_bytes)
+        payload_bytes = sum(len(p["payload"]) // 2 for p in packets_info)
+        byte_ratio = min(1.0, payload_bytes / total_bytes) if total_bytes > 0 else 0.0
 
         # TTL (use first packet's TTL as flow TTL)
         flow_ttl = ttls[0] if ttls else 64
 
-        # Create flow_id based on flow tuple
-        flow_id = hashlib.md5(
-            f"{src_ip}:{src_port}:{dst_ip}:{dst_port}:{protocol}".encode()
+        # Flow identity = 5-tuple AND the window it was first seen in.
+        #
+        # Keying on the 5-tuple alone meant a host reusing an ephemeral port
+        # produced a DIFFERENT flow with an IDENTICAL id, so two alerts minutes
+        # apart were indistinguishable and the hash-chained audit log could not
+        # separate them. SHA-256 rather than MD5: the truncation to 64 bits
+        # already makes collisions a practical concern over a long capture, and
+        # there is no reason to start from a weaker digest.
+        window_epoch = int(timestamps[0]) if timestamps and timestamps[0] > 0 else int(time.time())
+        flow_id = hashlib.sha256(
+            f"{src_ip}:{src_port}:{dst_ip}:{dst_port}:{protocol}:{window_epoch}".encode()
         ).hexdigest()[:16]
 
         # Populated for TLS/QUIC flows if Client Hello occurred; None otherwise
         flow_ja4 = ja4_map.get(flow_key) or ja4_map.get((dst_ip, dst_port, src_ip, src_port, protocol))
+
+        # ── Cross-window behavioural state ───────────────────────────────────
+        # Uses the flow's first arrival in this window as its sample point, so a
+        # burst inside one window counts once and the interval measured is the
+        # callback period rather than the intra-burst packet spacing.
+        first_ts = timestamps[0] if timestamps and timestamps[0] > 0 else time.time()
+        beacon_stats = _record_arrival(flow_key, first_ts)
+        fanout = _record_target(src_ip, dst_ip, dst_port, first_ts)
 
         # Create FlowRecord
         flow_record = FlowRecord(
@@ -427,13 +552,18 @@ def _build_flow_records(
             byte_ratio=byte_ratio,
             ttl=int(flow_ttl),
             ja4=flow_ja4,
-            beacon_interval_stats=None,
+            # Populated from cross-window state. This was hardcoded None, which
+            # meant the c2_beaconing rule - gated on `if flow.beacon_interval_stats`
+            # - could never fire on real captured traffic. One of the six
+            # mandated classes had no working rule-layer detection on live data.
+            beacon_interval_stats=beacon_stats,
             dns_ngram_entropy=_dns_ngram_entropy(
                 [n for p in packets_info for n in p.get("dns_names", [])]
             ),
-            # Distinct (dst_ip, dst_port) targets this flow's SOURCE touched in
-            # this window: high => scanning fan-out, ~1 => flood/normal session.
-            fanout_count=len(targets_by_source.get(src_ip, ())) or 1,
+            # Distinct (dst_ip, dst_port) targets this SOURCE touched over the
+            # cross-window horizon, not just this 120ms window. Window-local
+            # counting let a scanner evade the threshold purely by pacing.
+            fanout_count=max(fanout, len(targets_by_source.get(src_ip, ())) or 1),
         )
 
         flow_records.append(flow_record)
@@ -485,8 +615,82 @@ def _iter_json_objects(line_iter: Iterable[str]) -> Iterator[Dict[str, Any]]:
 
 
 def _live_tshark_command(interface: str) -> List[str]:
-    """Build the tshark command for line-buffered live JSON capture."""
-    return ["tshark", "-i", interface, "-l", "-n", "-T", "json"]
+    """Build the tshark command for line-buffered live JSON capture.
+
+    ``-J tls`` asks tshark to include the TLS protocol tree in its JSON output,
+    which is what makes live JA4 possible. Without it the live path produced no
+    handshake metadata at all and every live flow had ``ja4=None`` - so the JA4
+    rules, and model features 12-15, were dead on real traffic even though
+    CLAUDE.md calls JA4 the mandated primary signal for encrypted_malware.
+
+    This still decrypts nothing: only Client Hello metadata is read, which is
+    sent in the clear before any session key exists.
+    """
+    return ["tshark", "-i", interface, "-l", "-n", "-J", "tls ip tcp udp frame dns", "-T", "json"]
+
+
+def _ja4_from_packets(
+    packets: List[Dict[str, Any]]
+) -> Dict[Tuple[str, int, str, int, str], str]:
+    """Build a flow-key -> JA4 map from Client Hellos in a live packet batch.
+
+    The pcap path gets this from a second tshark pass (``_extract_ja4_map``),
+    which is not possible on a live stream - there is no file to re-read. This
+    reads the same handshake fields out of the packets already in hand.
+    """
+    out: Dict[Tuple[str, int, str, int, str], str] = {}
+    for packet in packets:
+        layers = packet.get("_source", {}).get("layers", {})
+        tls = layers.get("tls")
+        if not tls:
+            continue
+        blob = json.dumps(tls)
+        # Handshake type 1 == Client Hello. Anything else carries no JA4 input.
+        if '"tls.handshake.type": "1"' not in blob and '"tls.handshake.type":"1"' not in blob:
+            continue
+
+        def collect(field: str) -> List[str]:
+            """Pull every value for ``field`` out of the nested TLS tree."""
+            found: List[str] = []
+
+            def walk(node):
+                if isinstance(node, dict):
+                    for k, v in node.items():
+                        if k == field:
+                            found.extend(v if isinstance(v, list) else [v])
+                        else:
+                            walk(v)
+                elif isinstance(node, list):
+                    for item in node:
+                        walk(item)
+
+            walk(tls)
+            return [f for f in found if f not in ("", None)]
+
+        flow_key = _get_flow_key(packet)
+        src_ip, src_port, dst_ip, dst_port, protocol = flow_key
+        ciphers = collect("tls.handshake.ciphersuite")
+        exts = collect("tls.handshake.extension.type")
+        alpn = collect("tls.handshake.extensions_alpn_str")
+        sni = collect("tls.handshake.extensions_server_name")
+        versions = collect("tls.handshake.extensions.supported_version")
+        raw_ver = collect("tls.handshake.version")
+
+        try:
+            out[flow_key] = compute_ja4(
+                protocol=protocol,
+                tls_version=raw_ver[0] if raw_ver else None,
+                cipher_suites=ciphers,
+                extension_types=exts,
+                alpn=alpn[0] if alpn else None,
+                sni=sni[0] if sni else None,
+                supported_versions=versions,
+            )
+        except Exception:
+            # JA4 is best effort: a malformed handshake must not stop the
+            # window from being scored on every other signal.
+            continue
+    return out
 
 
 def extract_flows_from_interface(
@@ -591,9 +795,9 @@ def extract_flows_from_interface(
                     break
                 packets.append(item)
 
-            # JA4 is best-effort on the live path (no separate handshake pass);
-            # the shared builder pulls it from ja4_map, empty here.
-            yield _build_flow_records(packets, ja4_map={})
+            # JA4 is extracted from the Client Hellos in this window, so the
+            # live path now produces the same fingerprints the pcap path does.
+            yield _build_flow_records(packets, ja4_map=_ja4_from_packets(packets))
     finally:
         # Terminate tshark so the reader thread unblocks and no orphan remains.
         try:

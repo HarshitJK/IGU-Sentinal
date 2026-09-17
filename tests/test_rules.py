@@ -5,6 +5,27 @@ from igu_sentinel.schemas import FlowRecord
 from igu_sentinel.detect.rules import detect_rules
 
 
+def _make_flow(**overrides) -> FlowRecord:
+    """Build a FlowRecord with neutral defaults, overriding only what a test cares about."""
+    from datetime import datetime
+
+    base = dict(
+        flow_id="test_flow",
+        timestamp=datetime.now(),
+        src_port=54321,
+        dst_port=443,
+        protocol="TCP",
+        packet_size_stats={"min": 100.0, "max": 300.0, "mean": 200.0, "std": 40.0},
+        inter_arrival_stats={"mean": 0.5, "std": 0.1},
+        entropy=5.0,
+        byte_ratio=0.5,
+        ttl=64,
+    )
+    base.update(overrides)
+    return FlowRecord(**base)
+
+
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
@@ -139,3 +160,77 @@ def test_rules_detect_encrypted_malware_ja4():
     assert score.threat_class_guess == "encrypted_malware"
     assert any("ja4" in ev for ev in (score.evidence or []))
     print(f"✓ test_rules_detect_encrypted_malware_ja4 passed (calibrated: {score.calibrated_probability:.3f})")
+
+
+# ── Rule verdict selection ────────────────────────────────────────────────────
+
+def test_beacon_rule_fires_on_generator_output():
+    """The c2_beaconing rule must fire on the traffic the project generates.
+
+    Regression test for two stacked defects that made this rule score 0/105:
+      1. The interval window was 25-65s while the generator emits a 10s beacon,
+         and the jitter test was a strict `< 0.05` against a value of exactly
+         0.05 — so both conditions failed arithmetically.
+      2. Once it did fire, the JA4 block later in detect_rules() overwrote
+         threat_class_guess, because the verdict was last-write-wins.
+    """
+    from igu_sentinel.traffic_gen.generators import mock
+
+    flows = mock.generate("c2_beaconing", rate=20, duration=1, port=443)
+    guesses = [detect_rules(f).threat_class_guess for f in flows]
+    assert all(g == "c2_beaconing" for g in guesses), (
+        f"beacon rule must win on beaconing flows, got {set(guesses)}"
+    )
+    print("✓ test_beacon_rule_fires_on_generator_output passed")
+
+
+def test_beacon_jitter_boundary_is_inclusive():
+    """A beacon at exactly the jitter limit is regular, not irregular."""
+    from igu_sentinel.detect.rules import BEACON_JITTER_MAX
+
+    flow = _make_flow(
+        beacon_interval_stats={"mean": 60.0, "std": 60.0 * BEACON_JITTER_MAX},
+        dst_port=443,
+    )
+    assert detect_rules(flow).threat_class_guess == "c2_beaconing"
+    print("✓ test_beacon_jitter_boundary_is_inclusive passed")
+
+
+def test_rule_verdict_is_strongest_evidence_not_source_order():
+    """When several rules match, the verdict follows evidence weight.
+
+    The verdict used to be whichever rule appeared last in the function body,
+    so adding a rule could silently change the classification of flows that had
+    nothing to do with it.
+    """
+    # A flow that trips BOTH the beacon rule and the malicious-JA4 rule.
+    flow = _make_flow(
+        beacon_interval_stats={"mean": 60.0, "std": 1.0},
+        ja4="t13i050200_e133e205ac38_000000000000",   # on the IOC list
+        dst_port=443,
+        entropy=7.0,
+    )
+    score = detect_rules(flow)
+
+    assert score.threat_class_guess == "c2_beaconing", (
+        "behavioural beacon evidence must outweigh a JA4 toolkit match"
+    )
+    # Both matches must remain visible to fusion and to an analyst.
+    joined = " ".join(score.evidence)
+    assert "regular_beacon_interval" in joined
+    assert "malicious_ja4_fingerprint" in joined
+    assert "rule_candidates[" in joined, "runner-up classes must be reported"
+    print("✓ test_rule_verdict_is_strongest_evidence_not_source_order passed")
+
+
+def test_rule_verdict_is_deterministic_on_ties():
+    """Equal-weight candidates must resolve the same way every call."""
+    flow = _make_flow(
+        beacon_interval_stats={"mean": 60.0, "std": 1.0},
+        ja4="t13i050200_e133e205ac38_000000000000",
+        dst_port=443,
+        entropy=7.0,
+    )
+    verdicts = {detect_rules(flow).threat_class_guess for _ in range(20)}
+    assert len(verdicts) == 1, f"verdict must be stable, saw {verdicts}"
+    print("✓ test_rule_verdict_is_deterministic_on_ties passed")

@@ -184,3 +184,102 @@ def test_api_websocket_alerts_stream():
         assert isinstance(alert_json["evidence"], list)
 
     print("✓ test_api_websocket_alerts_stream passed")
+
+
+# ── Access control and input validation ───────────────────────────────────────
+
+def test_api_detect_rejects_malformed_flow():
+    """A flow that fails FlowRecord validation must return 422, not 500."""
+    from fastapi.testclient import TestClient
+    from igu_sentinel.api import app
+
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post("/detect", json=[{"flow_id": "missing_everything_else"}])
+    assert response.status_code == 422, "schema violation must be a client error"
+    assert "index" in json.dumps(response.json())
+    print("✓ test_api_detect_rejects_malformed_flow passed")
+
+
+def test_api_detect_rejects_oversize_batch():
+    """A batch beyond MAX_FLOWS_PER_REQUEST must be refused before processing."""
+    from fastapi.testclient import TestClient
+    from igu_sentinel.api import app, MAX_FLOWS_PER_REQUEST
+
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post("/detect", json=[{}] * (MAX_FLOWS_PER_REQUEST + 1))
+    assert response.status_code == 413
+    print("✓ test_api_detect_rejects_oversize_batch passed")
+
+
+def test_api_capture_start_rejects_bad_interface():
+    """An interface name outside the allowlist must be refused with 400."""
+    from fastapi.testclient import TestClient
+    from igu_sentinel.api import app
+
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post("/capture/start", json={"interface": "eth0; rm -rf /"})
+    assert response.status_code == 400
+    print("✓ test_api_capture_start_rejects_bad_interface passed")
+
+
+def test_api_requires_token_when_configured(monkeypatch):
+    """With IGU_API_TOKEN set, /detect and /capture/* must reject bad tokens."""
+    from fastapi.testclient import TestClient
+    from igu_sentinel.api import app
+
+    monkeypatch.setenv("IGU_API_TOKEN", "s3cret-token")
+    client = TestClient(app, raise_server_exceptions=False)
+
+    assert client.post("/detect", json=[]).status_code == 401, "no token must be rejected"
+    assert client.post(
+        "/detect", json=[], headers={"Authorization": "Bearer wrong"}
+    ).status_code == 401, "wrong token must be rejected"
+    assert client.get("/capture/status").status_code == 401
+
+    ok = client.post("/detect", json=[], headers={"Authorization": "Bearer s3cret-token"})
+    assert ok.status_code == 200, "correct token must be accepted"
+
+    # /health stays open so container healthchecks keep working.
+    assert client.get("/health").status_code == 200
+    print("✓ test_api_requires_token_when_configured passed")
+
+
+def test_api_websocket_rejects_bad_token(monkeypatch):
+    """The alert stream must not be readable without the configured token."""
+    from fastapi.testclient import TestClient
+    from igu_sentinel.api import app
+    import pytest
+
+    monkeypatch.setenv("IGU_API_TOKEN", "s3cret-token")
+    client = TestClient(app)
+
+    with pytest.raises(Exception):
+        with client.websocket_connect("/ws/alerts?token=wrong") as ws:
+            ws.receive_json()
+
+    # Correct token still connects.
+    with client.websocket_connect("/ws/alerts?token=s3cret-token") as ws:
+        assert ws is not None
+    print("✓ test_api_websocket_rejects_bad_token passed")
+
+
+def test_api_websocket_rejects_disallowed_origin(monkeypatch):
+    """WebSockets bypass CORS, so Origin must be enforced at the handshake."""
+    from fastapi.testclient import TestClient
+    from igu_sentinel.api import app
+    import pytest
+
+    monkeypatch.setenv("IGU_ALLOWED_ORIGINS", "http://localhost:5173")
+    client = TestClient(app)
+
+    with pytest.raises(Exception):
+        with client.websocket_connect(
+            "/ws/alerts", headers={"Origin": "https://evil.example"}
+        ) as ws:
+            ws.receive_json()
+
+    with client.websocket_connect(
+        "/ws/alerts", headers={"Origin": "http://localhost:5173"}
+    ) as ws:
+        assert ws is not None
+    print("✓ test_api_websocket_rejects_disallowed_origin passed")

@@ -1,31 +1,41 @@
 """FastAPI app orchestrating the detection pipeline with concurrent layer execution and WebSocket streaming.
 
 Pipeline Architecture:
-  - Detection layers (rules, stats, isoforest, xgb) run CONCURRENTLY per flow via asyncio.gather()
-    and asyncio.to_thread() to offload CPU-bound ML scoring without blocking the event loop.
+  - Detection layers are evaluated per capture window, not per flow. rules and
+    stats run straight through (pure Python, >350k flows/sec); isoforest and xgb
+    are called ONCE for the whole window via their batch entry points, because
+    their fixed per-call model overhead — not the per-row work — is what limits
+    throughput. See _score_batch() for the measurements.
+  - The whole batch is scored in a worker thread (asyncio.to_thread) so the
+    event loop stays responsive to WebSocket clients while a window is scored.
   - Fusion correlates LayerScores into an Alert with confidence scoring.
   - Alert logging applies SHA-256 hash chaining.
   - Real-time streaming broadcasts alerts over WebSocket at /ws/alerts to connected dashboards.
 """
 import asyncio
+import hmac
 import json
 import logging
+import os
+import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
+from pydantic import ValidationError
 from igu_sentinel.schemas import FlowRecord, Alert, LayerScore
 from igu_sentinel.detect.rules import detect_rules
 from igu_sentinel.detect.stats import train_stats_baseline, detect_stats
-from igu_sentinel.detect.isoforest import score_isoforest   # loaded at import
-from igu_sentinel.detect.xgb import predict_xgb             # loaded at import
+from igu_sentinel.detect.isoforest import score_isoforest, score_isoforest_batch  # loaded at import
+from igu_sentinel.detect.xgb import predict_xgb, predict_xgb_batch                # loaded at import
 from igu_sentinel.fusion import fuse_layers, is_actionable_alert
 from igu_sentinel.alert import log_alert
+from igu_sentinel.drift import monitor_drift, submit_confirmed_benign
 from igu_sentinel.ingest import (
     extract_flows_from_interface,
     LiveCaptureError,
@@ -34,6 +44,112 @@ from igu_sentinel.ingest import (
 
 log = logging.getLogger(__name__)
 app = FastAPI(title="IGU Sentinel", description="Passive Diode-Fed Threat Detection System")
+
+# ── Access control ────────────────────────────────────────────────────────────
+# This service exposes packet capture control and a live threat-alert feed. Both
+# were originally unauthenticated, which meant anyone who could reach the port
+# could start a capture on any interface of the host, or subscribe to the alert
+# stream. WebSockets are NOT covered by the browser same-origin policy, so any
+# web page the operator visited could open ws://<host>/ws/alerts and read the
+# feed — hence the explicit Origin check below in addition to CORS.
+#
+# Auth is enabled by setting IGU_API_TOKEN. It is off by default so the local
+# demo still runs with no setup; _warn_if_unauthenticated() makes that loud.
+_TOKEN_ENV = "IGU_API_TOKEN"
+_ORIGINS_ENV = "IGU_ALLOWED_ORIGINS"
+
+# Upper bound on a single /detect request. Without it, one request could pin
+# arbitrary memory and occupy the thread pool indefinitely.
+MAX_FLOWS_PER_REQUEST = int(os.environ.get("IGU_MAX_FLOWS_PER_REQUEST", "10000"))
+
+# A slow or wedged WebSocket client must not stall the broadcast to everyone
+# else, nor the capture thread feeding it.
+_WS_SEND_TIMEOUT_S = 2.0
+
+# The alert stream is server-push; clients have nothing to say. Anything larger
+# than a keepalive is refused rather than buffered.
+_WS_MAX_CLIENT_MESSAGE_BYTES = 4096
+
+# Interface names are passed to tshark. argv is a list (no shell), so this is
+# not command injection, but the allowlist keeps the surface tight and gives a
+# clear 400 instead of an opaque tshark failure.
+_IFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
+
+def _configured_token() -> Optional[str]:
+    token = os.environ.get(_TOKEN_ENV)
+    return token if token else None
+
+
+def _allowed_origins() -> List[str]:
+    raw = os.environ.get(_ORIGINS_ENV, "")
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+def _warn_if_unauthenticated() -> None:
+    if _configured_token() is None:
+        log.warning(
+            "%s is not set: /detect, /capture/* and /ws/alerts are UNAUTHENTICATED. "
+            "Set %s before exposing this service beyond localhost.",
+            _TOKEN_ENV,
+            _TOKEN_ENV,
+        )
+
+
+_warn_if_unauthenticated()
+
+# CORS is deny-by-default: with no IGU_ALLOWED_ORIGINS the browser blocks
+# cross-origin calls, which is what we want for a same-origin dashboard. The
+# Vite dev server proxies /detect, /capture and /ws, so development needs no
+# entry here either.
+if _allowed_origins():
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_allowed_origins(),
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+
+def require_token(authorization: Optional[str] = Header(default=None)) -> None:
+    """Reject the request when IGU_API_TOKEN is set and the bearer token is wrong.
+
+    Compared with :func:`hmac.compare_digest` so a wrong token cannot be
+    recovered by timing the response.
+    """
+    expected = _configured_token()
+    if expected is None:
+        return
+    supplied = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        supplied = authorization.split(" ", 1)[1].strip()
+    if not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+
+
+def _websocket_authorized(websocket: WebSocket) -> bool:
+    """Authorize a WebSocket handshake by Origin and, if configured, token.
+
+    The browser same-origin policy does not apply to WebSockets, so the Origin
+    header must be checked here or any site could subscribe to the alert feed.
+    """
+    allowed = _allowed_origins()
+    origin = websocket.headers.get("origin")
+    # A browser always sends Origin; non-browser clients (tests, CLI) do not.
+    if origin is not None and allowed and origin not in allowed:
+        log.warning("rejected WebSocket from disallowed origin %s", origin)
+        return False
+
+    expected = _configured_token()
+    if expected is None:
+        return True
+    supplied = websocket.query_params.get("token", "")
+    auth = websocket.headers.get("authorization", "")
+    if not supplied and auth.lower().startswith("bearer "):
+        supplied = auth.split(" ", 1)[1].strip()
+    return hmac.compare_digest(supplied, expected)
+
 
 # ── WebSocket connection manager ──────────────────────────────────────────────
 class ConnectionManager:
@@ -52,7 +168,14 @@ class ConnectionManager:
         log.info("WebSocket client disconnected. Active: %d", len(self.active_connections))
 
     async def broadcast_alert(self, alert: Alert):
-        """Broadcast an Alert as JSON to all active WebSocket connections."""
+        """Broadcast an Alert as JSON to all active WebSocket connections.
+
+        Sends run concurrently with a per-connection timeout. Sending serially
+        without a timeout let one wedged client stall the broadcast for every
+        other client — and, on the live-capture path, stall the capture thread
+        that was waiting on this coroutine. A client that times out is treated
+        as dead and dropped.
+        """
         if not self.active_connections:
             return
 
@@ -64,18 +187,72 @@ class ConnectionManager:
             "evidence": alert.evidence,
         }
 
-        dead_connections = set()
-        for connection in list(self.active_connections):
-            try:
-                await connection.send_json(payload)
-            except Exception:
-                dead_connections.add(connection)
+        connections = list(self.active_connections)
 
-        for dead in dead_connections:
-            self.disconnect(dead)
+        async def _send(conn: WebSocket) -> bool:
+            try:
+                await asyncio.wait_for(conn.send_json(payload), timeout=_WS_SEND_TIMEOUT_S)
+                return True
+            except Exception:
+                return False
+
+        results = await asyncio.gather(
+            *(_send(c) for c in connections), return_exceptions=True
+        )
+        for conn, ok in zip(connections, results):
+            if ok is not True:
+                self.disconnect(conn)
 
 
 manager = ConnectionManager()
+
+
+def _feed_drift_monitor(
+    scored: List[tuple], flows: List[FlowRecord]
+) -> None:
+    """Route each batch's isoforest scores and benign verdicts into drift/.
+
+    Two separate jobs, both required by CLAUDE.md and neither of which was
+    connected to anything before — drift/ existed but nothing ever called it:
+
+      * Drift monitoring reads the isoforest anomaly-score distribution.
+      * The retrain pool accepts only flows the FUSED cross-layer verdict
+        cleared, never flows isoforest merely scored low. Retraining on what the
+        model already likes is the poisoning path the PS constraints rule out.
+
+    Never allowed to break scoring: a drift bookkeeping error must not drop a
+    detection.
+    """
+    try:
+        iso_scores = [
+            s.raw_score
+            for layer_scores, _alert in scored
+            for s in layer_scores
+            if s.layer_name == "isoforest"
+        ]
+        if iso_scores and monitor_drift(iso_scores):
+            log.warning(
+                "drift detected in isoforest score distribution — "
+                "retrain is gated on the confirmed-benign pool and the boundary bound"
+            )
+
+        confirmed_benign = [
+            flow
+            for flow, (layer_scores, alert) in zip(flows, scored)
+            if not is_actionable_alert(layer_scores, alert)
+        ]
+        if confirmed_benign:
+            submit_confirmed_benign(confirmed_benign)
+    except Exception:
+        log.exception("drift monitoring failed (scoring unaffected)")
+
+
+def _log_broadcast_failure(fut) -> None:
+    """Surface a failed fire-and-forget broadcast without blocking the caller."""
+    try:
+        fut.result()
+    except Exception:
+        log.exception("live capture: alert broadcast failed")
 
 
 # ── Live capture controller ───────────────────────────────────────────────────
@@ -166,13 +343,18 @@ class CaptureController:
                     log_alert(alert)
                     self.state["alerts_emitted"] += 1
                     # Broadcast on the main event loop where the WS clients live.
+                    # Fire-and-forget: blocking the capture thread on each
+                    # broadcast made dashboard latency backpressure the capture
+                    # itself, so a slow client dropped packets. Delivery errors
+                    # are reported by the callback; the broadcast has its own
+                    # per-connection timeout.
                     try:
                         fut = asyncio.run_coroutine_threadsafe(
                             manager.broadcast_alert(alert), loop
                         )
-                        fut.result(timeout=5)
+                        fut.add_done_callback(_log_broadcast_failure)
                     except Exception:
-                        log.exception("live capture: alert broadcast failed")
+                        log.exception("live capture: could not schedule alert broadcast")
         except LiveCaptureError as exc:
             self.state["status"] = "error"
             self.state["error"] = str(exc)
@@ -193,6 +375,15 @@ class CaptureController:
             thread = self._thread
         if thread is not None:
             thread.join(timeout=6)
+            if thread.is_alive():
+                # Reporting "stopped" while the worker is still running told the
+                # operator the capture had ended when it had not.
+                self.state["status"] = "stopping"
+                self.state["error"] = "capture thread did not stop within 6s"
+                return
+        if self.state.get("status") == "idle":
+            # Nothing was ever started; "stopped" would imply otherwise.
+            return
         if self.state.get("status") != "error":
             self.state["status"] = "stopped"
 
@@ -202,13 +393,27 @@ capture = CaptureController()
 
 # ── One-time startup state ────────────────────────────────────────────────────
 _stats_trained: bool = False
+# The capture worker thread and request handlers both reach this, so the
+# "train once" flag needs a lock: two threads could both observe False and both
+# call train_stats_baseline(), which rebinds detect/stats.py's module-global
+# baseline while another thread is reading it.
+_stats_lock = threading.Lock()
 
 
 def _ensure_stats_baseline() -> None:
-    """Train stats baseline from benign fixture once on first use."""
+    """Train stats baseline from benign fixture once on first use (thread-safe)."""
     global _stats_trained
     if _stats_trained:
         return
+    with _stats_lock:
+        if _stats_trained:      # re-check: another thread may have won the race
+            return
+        _train_stats_baseline_once()
+
+
+def _train_stats_baseline_once() -> None:
+    """Load the benign corpus and fit the z-score baseline. Caller holds the lock."""
+    global _stats_trained
 
     fixtures_dir = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
     benign_file = fixtures_dir / "benign_sample.jsonl"
@@ -256,15 +461,48 @@ async def detect_flow_async(flow: FlowRecord) -> Alert:
     return alert
 
 
+def _score_batch(flows: List[FlowRecord]) -> List[tuple[List[LayerScore], Alert]]:
+    """Score a whole window of flows, batching the two model layers.
+
+    The ML layers dominate cost and both carry a large fixed per-call overhead,
+    so they are called once for the batch rather than once per flow. Measured on
+    the fixture corpus, per-flow scoring ran the pipeline at ~130 flows/sec with
+    Isolation Forest alone costing 6.8 ms per flow; batching the same work lifts
+    it by roughly two orders of magnitude. rules and stats are pure Python at
+    >350k flows/sec, so they stay per-flow where they are already free.
+
+    Ordering is preserved: each layer returns one score per input flow, in
+    input order, and fusion is applied per flow afterwards.
+    """
+    if not flows:
+        return []
+
+    rules_scores = [detect_rules(f) for f in flows]
+    stats_scores = [detect_stats(f) for f in flows]
+    iso_scores = score_isoforest_batch(flows)
+    xgb_scores = predict_xgb_batch(flows)
+
+    results: List[tuple[List[LayerScore], Alert]] = []
+    for r, st, iso, xg in zip(rules_scores, stats_scores, iso_scores, xgb_scores):
+        scores = [r, st, iso, xg]
+        results.append((scores, fuse_layers(scores)))
+    return results
+
+
 async def run_detection_pipeline_scored_async(
     flows: List[FlowRecord],
 ) -> List[tuple[List[LayerScore], Alert]]:
-    """Run the pipeline concurrently, keeping each flow's LayerScores."""
+    """Run the pipeline over a batch, keeping each flow's LayerScores.
+
+    The CPU-bound scoring runs in a worker thread so the event loop stays free
+    to serve WebSocket clients and other requests while a window is scored.
+    """
     if not flows:
         return []
     _ensure_stats_baseline()
-    tasks = [detect_flow_scored_async(f) for f in flows]
-    return list(await asyncio.gather(*tasks))
+    scored = await asyncio.to_thread(_score_batch, flows)
+    _feed_drift_monitor(scored, flows)
+    return scored
 
 
 async def run_detection_pipeline_async(flows: List[FlowRecord]) -> List[Alert]:
@@ -277,33 +515,20 @@ def run_detection_pipeline_scored(
 ) -> List[tuple[List[LayerScore], Alert]]:
     """Synchronous pipeline entry point keeping each flow's LayerScores.
 
-    Dispatches detection layers concurrently using ThreadPoolExecutor if an event
-    loop is already running, or via asyncio.run() otherwise.
+    Scores the batch directly. The previous implementation spun up a fresh
+    ThreadPoolExecutor per call (or a whole event loop via asyncio.run()) and
+    dispatched four tasks per flow. That cost more than the work it parallelised:
+    the layers are either trivial pure-Python or single model calls that hold the
+    GIL, so the fan-out bought nothing and the setup was pure overhead —
+    measurably slower than scoring the same flows straight through.
     """
     if not flows:
         return []
 
     _ensure_stats_baseline()
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        # Inside existing event loop: run layers concurrently across threads
-        with ThreadPoolExecutor(max_workers=min(32, (len(flows) * 4) or 1)) as executor:
-            results: List[tuple[List[LayerScore], Alert]] = []
-            for flow in flows:
-                f_rules = executor.submit(detect_rules, flow)
-                f_stats = executor.submit(detect_stats, flow)
-                f_iso = executor.submit(score_isoforest, flow)
-                f_xgb = executor.submit(predict_xgb, flow)
-                scores = [f_rules.result(), f_stats.result(), f_iso.result(), f_xgb.result()]
-                results.append((scores, fuse_layers(scores)))
-            return results
-    else:
-        return asyncio.run(run_detection_pipeline_scored_async(flows))
+    results = _score_batch(flows)
+    _feed_drift_monitor(results, flows)
+    return results
 
 
 def run_detection_pipeline(flows: List[FlowRecord]) -> List[Alert]:
@@ -326,19 +551,36 @@ async def health_check():
 
 @app.websocket("/ws/alerts")
 async def websocket_alerts(websocket: WebSocket):
-    """WebSocket endpoint streaming alerts in real-time as flows are processed."""
+    """WebSocket endpoint streaming alerts in real-time as flows are processed.
+
+    The handshake is authorized before the socket is accepted: Origin is checked
+    against IGU_ALLOWED_ORIGINS (WebSockets bypass the browser same-origin
+    policy) and, when IGU_API_TOKEN is set, a bearer token is required via the
+    Authorization header or a ``token`` query parameter.
+    """
+    if not _websocket_authorized(websocket):
+        # 1008 = policy violation.
+        await websocket.close(code=1008)
+        return
     await manager.connect(websocket)
     try:
         while True:
-            # Keep connection open; receive client pings/messages if any
-            await websocket.receive_text()
+            # The alert feed is server-push only; this read exists solely to
+            # keep the connection open and to notice disconnects. Client input
+            # is bounded and discarded — an unbounded receive_text() let a
+            # client make the server buffer arbitrary data it never reads.
+            message = await websocket.receive_text()
+            if len(message) > _WS_MAX_CLIENT_MESSAGE_BYTES:
+                log.warning("WebSocket client sent %d bytes — closing", len(message))
+                await websocket.close(code=1009)   # message too big
+                break
     except WebSocketDisconnect:
         manager.disconnect(websocket)
     except Exception:
         manager.disconnect(websocket)
 
 
-@app.post("/detect")
+@app.post("/detect", dependencies=[Depends(require_token)])
 async def detect(flows: list[dict]) -> list[dict]:
     """Run detection pipeline on flows.
 
@@ -350,8 +592,30 @@ async def detect(flows: list[dict]) -> list[dict]:
 
     Returns:
         List of Alert dicts.
+
+    Raises:
+        HTTPException: 413 if the batch exceeds MAX_FLOWS_PER_REQUEST,
+            422 if any flow fails FlowRecord validation.
     """
-    flow_records = [FlowRecord(**f) for f in flows]
+    if len(flows) > MAX_FLOWS_PER_REQUEST:
+        raise HTTPException(
+            status_code=413,
+            detail=f"batch of {len(flows)} exceeds limit of {MAX_FLOWS_PER_REQUEST} flows",
+        )
+
+    # Zero trust at the data level (CLAUDE.md): validate every record against
+    # the schema and reject the batch with a precise 422. Letting the
+    # ValidationError escape turned malformed input into an opaque HTTP 500.
+    flow_records: List[FlowRecord] = []
+    for idx, f in enumerate(flows):
+        try:
+            flow_records.append(FlowRecord(**f))
+        except (ValidationError, TypeError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid FlowRecord", "index": idx, "reason": str(exc)},
+            ) from exc
+
     scored = await run_detection_pipeline_scored_async(flow_records)
     alerts = [alert for _s, alert in scored]
 
@@ -378,7 +642,7 @@ async def detect(flows: list[dict]) -> list[dict]:
 
 # ── Live capture control endpoints ────────────────────────────────────────────
 
-@app.post("/capture/start")
+@app.post("/capture/start", dependencies=[Depends(require_token)])
 async def capture_start(config: dict):
     """Start continuous live capture on an interface.
 
@@ -395,6 +659,17 @@ async def capture_start(config: dict):
         return JSONResponse(
             status_code=400,
             content={"status": "error", "error": "'interface' (string) is required"},
+        )
+    if not _IFACE_RE.match(interface):
+        # tshark is invoked with an argv list, so this is not a shell-injection
+        # fix — it rejects nonsense early with a clear error instead of spawning
+        # a doomed capture process per request.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "error": "'interface' must match [A-Za-z0-9_.:-]{1,64}",
+            },
         )
     try:
         window_ms = int(config.get("window_ms", DEFAULT_WINDOW_MS))
@@ -428,7 +703,7 @@ async def capture_start(config: dict):
     return capture.snapshot()
 
 
-@app.post("/capture/stop")
+@app.post("/capture/stop", dependencies=[Depends(require_token)])
 async def capture_stop():
     """Stop the active live capture (idempotent)."""
     if not capture.is_running():
@@ -437,7 +712,7 @@ async def capture_stop():
     return capture.snapshot()
 
 
-@app.get("/capture/status")
+@app.get("/capture/status", dependencies=[Depends(require_token)])
 async def capture_status():
     """Return the current live-capture status and counters."""
     return capture.snapshot()
@@ -445,7 +720,25 @@ async def capture_status():
 
 @app.get("/dashboard")
 async def dashboard():
-    """Serve the live demo dashboard HTML."""
+    """Serve the live demo dashboard HTML.
+
+    When IGU_API_TOKEN is configured the HTML is patched to include a
+    ``<meta name="iguToken">`` tag that the dashboard's JavaScript reads to
+    authenticate its WebSocket connection.  Without the token the dashboard
+    is served as-is and the WebSocket handshake skips auth (consistent with
+    IGU_API_TOKEN being unset on the backend).
+
+    FileResponse is not used here because it streams the file directly
+    without giving the server a chance to modify it.  HTMLResponse accepts a
+    string, which is cheap for a ~18 KB HTML file.
+    """
     dashboard_file = Path(__file__).parent / "dashboard.html"
-    return FileResponse(dashboard_file, media_type="text/html")
+    html = dashboard_file.read_text(encoding="utf-8")
+    token = _configured_token()
+    if token:
+        # Inject the token as a meta tag right after <head> so the JS can
+        # read it without any template engine dependency.
+        meta_tag = f'\n    <meta name="iguToken" content="{token}">'
+        html = html.replace("<head>", f"<head>{meta_tag}", 1)
+    return HTMLResponse(content=html)
 
