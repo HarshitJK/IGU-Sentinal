@@ -106,3 +106,8 @@ pyrightconfig.json
 .Spotlight-V100
 .Trashes
 ehthumbs.db
+
+# Dependencies & external data
+node_modules/
+frontend/node_modules/
+data/

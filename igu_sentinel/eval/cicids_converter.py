@@ -23,8 +23,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from igu_sentinel.detect.features import extract_features
-from igu_sentinel.detect.xgb import get_model
-from igu_sentinel.schemas import FlowRecord, StatsSummary
+from igu_sentinel.detect.xgb import predict_xgb_batch, THREAT_CLASSES
+from igu_sentinel.schemas import FlowRecord
 
 logger = logging.getLogger(__name__)
 
@@ -34,15 +34,27 @@ _COLUMN_ALIASES = {
     "dst_port": ["destination port", "dst port", "dsport", "id.resp_p"],
     "protocol": ["protocol", "proto"],
     "flow_duration": ["flow duration", "dur"],
-    "fwd_packets": ["total fwd packets", "tot fwd pkts", "spkts"],
-    "fwd_bytes": ["total length of fwd packets", "totlen fwd pkts", "sbytes"],
-    "fwd_pkt_len_mean": ["fwd packet length mean", "fwd pkt len mean", "smeansz"],
+    "fwd_packets": ["total fwd packets", "tot fwd pkts", "spkts", "total fwd packet"],
+    # Payload bytes (forward direction only — no Bwd columns)
+    "fwd_bytes": ["total length of fwd packets", "totlen fwd pkts", "sbytes",
+                  "total length of fwd packet", "subflow fwd bytes"],
+    # Header bytes for byte_ratio denominator
+    "fwd_hdr_len": ["fwd header length"],
+    "fwd_pkt_len_mean": ["fwd packet length mean", "fwd pkt len mean", "smeansz",
+                        "fwd segment size avg"],
     "fwd_pkt_len_std": ["fwd packet length std", "fwd pkt len std"],
-    "fwd_pkt_len_min": ["fwd packet length min", "fwd pkt len min"],
+    "fwd_pkt_len_min": ["fwd packet length min", "fwd pkt len min", "fwd seg size min"],
     "fwd_pkt_len_max": ["fwd packet length max", "fwd pkt len max"],
-    "fwd_iat_mean": ["fwd iat mean", "flow iat mean"],
-    "fwd_iat_std": ["fwd iat std", "flow iat std"],
-    "ttl": ["fwd header length", "sttl"],
+    "pkt_len_variance": ["packet length variance"],
+    # Use dedicated forward-direction IAT columns (not the bidirectional flow IAT).
+    # CICFlowMeter computes both; Fwd IAT Mean is what a diode sensor would observe.
+    "fwd_iat_mean": ["fwd iat mean"],
+    "fwd_iat_std": ["fwd iat std"],
+    # Flow-level IAT as fallback when Fwd IAT columns are absent
+    "flow_iat_mean": ["flow iat mean"],
+    "flow_iat_std": ["flow iat std"],
+    # TTL via TTL column (not header-length); header-length used for byte_ratio
+    "ttl": ["sttl"],
     "label": ["label", "attack_cat", "attack category"],
 }
 
@@ -83,7 +95,7 @@ def _normalise(col: str) -> str:
     return col.strip().lower().replace("_", " ").replace("-", " ")
 
 
-def map_cicids_label(raw_label: str) -> Optional[str]:
+def map_cicids_label(raw_label: Optional[str]) -> Optional[str]:
     """Map a raw CIC-IDS2017 label string to one of the 7 project classes.
 
     Returns:
@@ -91,6 +103,8 @@ def map_cicids_label(raw_label: str) -> Optional[str]:
                 'encrypted_malware', 'recon_scanning', 'data_exfiltration'},
         or None if the label cannot be mapped cleanly.
     """
+    if not raw_label or not isinstance(raw_label, str):
+        return None
     cleaned = raw_label.strip().lower()
     if cleaned in _LABEL_MAPPING:
         return _LABEL_MAPPING[cleaned]
@@ -109,7 +123,9 @@ def convert_row_to_flow_record(
 
     Only forward-direction fields are used; all Bwd_* columns are dropped.
     """
-    raw_label = row.get(col_map.get("label", ""), "benign")
+    if not row or not isinstance(row, dict):
+        return None
+    raw_label = row.get(col_map.get("label", "")) or "benign"
     mapped_label = map_cicids_label(raw_label)
     if mapped_label is None:
         return None
@@ -136,12 +152,39 @@ def convert_row_to_flow_record(
     fwd_len_min = _get_float("fwd_pkt_len_min", 0.0)
     fwd_len_max = _get_float("fwd_pkt_len_max", fwd_len_mean)
 
-    # Convert microsecond IATs in CIC-IDS to seconds
-    fwd_iat_mean_s = _get_float("fwd_iat_mean", 0.0) / 1e6
-    fwd_iat_std_s = _get_float("fwd_iat_std", 0.0) / 1e6
+    # DIODE NOTE: we use forward-direction IAT exclusively (Fwd IAT Mean/Std),
+    # never the bidirectional Flow IAT columns.  Fallback to flow-level only if
+    # the dedicated Fwd IAT columns are absent from this CSV variant.
+    fwd_iat_mean_us = _get_float("fwd_iat_mean", -1.0)
+    if fwd_iat_mean_us < 0:  # column absent — use bidirectional fallback
+        fwd_iat_mean_us = _get_float("flow_iat_mean", 0.0)
+        fwd_iat_std_us = _get_float("flow_iat_std", 0.0)
+    else:
+        fwd_iat_std_us = _get_float("fwd_iat_std", 0.0)
+    # CICFlowMeter stores IATs in microseconds; convert to seconds.
+    fwd_iat_mean_s = fwd_iat_mean_us / 1e6
+    fwd_iat_std_s = fwd_iat_std_us / 1e6
 
-    # In a diode configuration, return bytes are unobserved (byte_ratio=1.0)
-    byte_ratio = 1.0
+    # byte_ratio: payload bytes / (payload + header bytes)
+    # This is the only ratio a diode sensor can measure from forward frames.
+    # Hard-coding 1.0 made every flow look like data_exfiltration (model feature 7).
+    fwd_payload = _get_float("fwd_bytes", 0.0)
+    fwd_hdr = _get_float("fwd_hdr_len", 0.0)
+    total_observed = fwd_payload + fwd_hdr
+    byte_ratio = min(1.0, fwd_payload / total_observed) if total_observed > 0 else 0.5
+
+    # Proxy entropy from packet length variance.
+    # CIC-IDS does not expose Shannon entropy directly.  Variance of packet sizes
+    # correlates with randomness: encrypted/compressed payloads produce large, similar
+    # packets (low variance, high entropy), while scans produce tiny uniform probes.
+    # We map variance → [0, 8] range: variance of ~60,000 bytes² → entropy ≈ 8.
+    pkt_variance = _get_float("pkt_len_variance", -1.0)
+    if pkt_variance >= 0:
+        # sqrt(variance) = std; map 0..1000 bytes → 0..8 bits
+        proxy_entropy = min(8.0, (pkt_variance ** 0.5) / 125.0)
+    else:
+        # Fallback: use fwd_pkt_len_std
+        proxy_entropy = min(8.0, fwd_len_std / 125.0)
 
     record = FlowRecord(
         flow_id=f"cicids_{index:07d}",
@@ -149,19 +192,19 @@ def convert_row_to_flow_record(
         src_port=0,
         dst_port=dst_port,
         protocol=proto_str,
-        packet_size_stats=StatsSummary(
-            min=fwd_len_min,
-            max=fwd_len_max,
-            mean=fwd_len_mean,
-            std=fwd_len_std,
-        ),
-        inter_arrival_stats=StatsSummary(
-            min=0.0,
-            max=fwd_iat_mean_s * 2.0,
-            mean=fwd_iat_mean_s,
-            std=fwd_iat_std_s,
-        ),
-        entropy=0.0,  # Unmeasured in standard NetFlow/CIC-IDS CSV summary
+        packet_size_stats={
+            "min": fwd_len_min,
+            "max": fwd_len_max,
+            "mean": fwd_len_mean,
+            "std": fwd_len_std,
+        },
+        inter_arrival_stats={
+            "min": 0.0,
+            "max": fwd_iat_mean_s * 2.0,
+            "mean": fwd_iat_mean_s,
+            "std": fwd_iat_std_s,
+        },
+        entropy=proxy_entropy,
         byte_ratio=byte_ratio,
         ttl=_get_int("ttl", 64),
         ja4=None,
@@ -210,7 +253,7 @@ def load_cicids_dataset(
                 break
             result = convert_row_to_flow_record(row, col_map, i)
             if result is None:
-                raw_lbl = row.get(col_map.get("label", ""), "unknown").strip()
+                raw_lbl = str(row.get(col_map.get("label", ""), "unknown") or "unknown").strip()
                 dropped_counts[raw_lbl] = dropped_counts.get(raw_lbl, 0) + 1
                 continue
             flow, label = result
@@ -232,12 +275,9 @@ def run_inference_benchmark(
     if not flows:
         raise ValueError(f"No usable flows extracted from {csv_path}")
 
-    model = get_model()
-    class_labels = model.class_labels  # 7 classes
-
-    X = np.array([extract_features(f) for f in flows], dtype=float)
-    y_pred_probs = model.predict(X)
-    y_pred = [class_labels[np.argmax(p)] for p in y_pred_probs]
+    layer_scores = predict_xgb_batch(flows)
+    y_pred = [s.threat_class_guess or "benign" for s in layer_scores]
+    class_labels = THREAT_CLASSES
 
     # Calculate metrics
     metrics = {}
