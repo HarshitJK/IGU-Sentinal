@@ -86,6 +86,8 @@ services:
   # Test container on prod-net
   prod-test:
     image: busybox:latest
+    cap_add:
+      - NET_ADMIN
     networks:
       - prod-net
     command: sleep 3600
@@ -95,6 +97,8 @@ services:
   # Test container on enclave-net
   enclave-test:
     image: busybox:latest
+    cap_add:
+      - NET_ADMIN
     networks:
       - enclave-net
     command: sleep 3600
