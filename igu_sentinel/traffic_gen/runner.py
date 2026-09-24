@@ -25,13 +25,31 @@ GENERATOR_MAP = {
     "exfiltration": exfiltration.generate,
 }
 
+# Variant keys the runner consumes itself; everything else in a lab variant is
+# forwarded to the generator as an extra lab parameter (attack, iface, port,
+# max_sockets, domain, lab_suffix, ...).
+_RESERVED_KEYS = {
+    "threat_class", "tool", "source_mode", "rate", "size", "port", "duration",
+    "mode", "target",
+}
 
-def run_traffic_gen(config_path: str) -> List[Dict[str, Any]]:
+# Only these generators know how to drive real lab traffic. A lab variant that
+# routes anywhere else is a config error, not a silent mock fallback.
+_LAB_CAPABLE_TOOLS = {"ddos", "dns_tunneling"}
+
+
+def run_traffic_gen(config_path: str, allow_lab: bool = False) -> List[Dict[str, Any]]:
     """
     Run config-driven traffic generation.
 
     Args:
         config_path: Path to yaml config file with variants.
+        allow_lab: When False (default), any variant with ``mode: lab`` is SKIPPED
+            rather than run. This keeps the mock aggregate paths (``make gen-data``,
+            :func:`run_all_configs`, eval/train helpers) CI-safe: they will never
+            spawn real traffic just because a lab config sits in the config
+            directory. Set True only from an explicit lab invocation
+            (``make gen-data-lab`` / the CLI on a single config).
 
     Returns:
         List of {threat_class, flow} dicts for each generated flow.
@@ -50,21 +68,54 @@ def run_traffic_gen(config_path: str) -> List[Dict[str, Any]]:
         size = variant.get("size", 128)
         port = variant.get("port", 80)
         duration = variant.get("duration", 1)
+        mode = variant.get("mode", "mock")
+
+        # Lab variants generate REAL traffic; never run them from a mock/aggregate
+        # caller. Skip (don't error) so a lab config can coexist in config/.
+        if mode == "lab" and not allow_lab:
+            print(
+                f"[traffic-gen] skipping lab variant "
+                f"(threat_class={threat_class}, attack={variant.get('attack')}): "
+                f"run `make gen-data-lab` to execute it"
+            )
+            continue
 
         # Get generator function
         if tool not in GENERATOR_MAP:
             tool = "mock"  # Fallback to mock
         generator_fn = GENERATOR_MAP[tool]
 
-        # Call generator with variant params
-        flows = generator_fn(
-            threat_class=threat_class,
-            source_mode=source_mode,
-            rate=max(1, int(rate)),
-            size=int(size),
-            port=int(port),
-            duration=int(duration),
-        )
+        if mode == "lab":
+            # Real-traffic path: only the lab-capable generators support it, and
+            # a lab run needs an explicit target.
+            if tool not in _LAB_CAPABLE_TOOLS:
+                raise ValueError(
+                    f"mode: lab is only supported by tools {sorted(_LAB_CAPABLE_TOOLS)}, "
+                    f"not {tool!r} (threat_class={threat_class!r})"
+                )
+            extra = {k: v for k, v in variant.items() if k not in _RESERVED_KEYS}
+            flows = generator_fn(
+                threat_class=threat_class,
+                source_mode=source_mode,
+                rate=max(1, int(rate)),
+                size=int(size),
+                port=int(port),
+                duration=int(duration),
+                mode="lab",
+                target=variant.get("target"),
+                **extra,
+            )
+        else:
+            # mock mode (default): unchanged call — no new kwargs are passed, so
+            # every existing generator and config behaves exactly as before.
+            flows = generator_fn(
+                threat_class=threat_class,
+                source_mode=source_mode,
+                rate=max(1, int(rate)),
+                size=int(size),
+                port=int(port),
+                duration=int(duration),
+            )
 
         # Label each flow with its threat class
         for flow in flows:
@@ -76,7 +127,7 @@ def run_traffic_gen(config_path: str) -> List[Dict[str, Any]]:
     return labeled_flows
 
 
-def run_all_configs(config_dir: str | None = None) -> List[Dict[str, Any]]:
+def run_all_configs(config_dir: str | None = None, allow_lab: bool = False) -> List[Dict[str, Any]]:
     """
     Run traffic generation for every YAML config in the config directory.
 
@@ -99,7 +150,7 @@ def run_all_configs(config_dir: str | None = None) -> List[Dict[str, Any]]:
     all_flows: List[Dict[str, Any]] = []
     for yaml_file in yaml_files:
         print(f"[traffic-gen] Running config: {yaml_file.name}")
-        flows = run_traffic_gen(str(yaml_file))
+        flows = run_traffic_gen(str(yaml_file), allow_lab=allow_lab)
         all_flows.extend(flows)
         print(f"[traffic-gen]   Generated {len(flows)} flows")
 
@@ -116,8 +167,11 @@ if __name__ == "__main__":
 
     arg = sys.argv[1]
 
+    # A direct CLI invocation is an explicit, human-initiated run, so it is
+    # allowed to execute lab variants (this is how `make gen-data-lab` fires the
+    # real generators). Library/aggregate callers keep the CI-safe default.
     if arg == "--all":
-        run_all_configs()
+        run_all_configs(allow_lab=True)
     else:
-        run_traffic_gen(arg)
+        run_traffic_gen(arg, allow_lab=True)
 

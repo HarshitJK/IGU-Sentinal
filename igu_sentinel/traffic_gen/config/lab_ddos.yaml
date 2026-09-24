@@ -1,0 +1,74 @@
+# REAL lab traffic generation config (mode: lab).
+#
+# ⚠️  Unlike every other config in this directory, these variants generate REAL
+#     packets. Run this ONLY inside your lab compose network, against a target
+#     you own. `make gen-data-lab` runs it; ordinary `make gen-data` and the test
+#     suite never touch it (they use the mock-based configs).
+#
+# Point `target` at your lab endpoint. It MUST be one of:
+#   * a loopback address        (127.0.0.1)
+#   * an RFC1918 private address (10.x / 172.16-31.x / 192.168.x)
+#   * a compose-service hostname ending in a lab suffix (e.g. `sentinel-lab-target`)
+# Any public IP/hostname is refused with a ValueError before a single packet is
+# sent. Set `lab_suffix:` on a variant to allow an extra hostname suffix.
+#
+# `iface` is the capture interface (default `lo`); set it to the interface your
+# lab traffic actually crosses inside the compose network.
+#
+# Required tools per variant: tshark everywhere; hping3 (+timeout) for the floods;
+# nothing extra for slowloris/dga (pure-Python); dnscat2 or iodine for dns_tunnel.
+
+variants:
+  # ── SYN flood (hping3 -S --flood --rand-source), bounded by `timeout` ────────
+  - threat_class: volumetric_ddos
+    tool: ddos
+    mode: lab
+    attack: syn_flood
+    target: sentinel-lab-target   # <-- point at your compose service / lab host
+    iface: lo
+    port: 80
+    duration: 15
+
+  # ── UDP flood (hping3 --udp --flood --rand-source) ──────────────────────────
+  - threat_class: volumetric_ddos
+    tool: ddos
+    mode: lab
+    attack: udp_flood
+    target: sentinel-lab-target
+    iface: lo
+    port: 53
+    duration: 15
+
+  # ── Slowloris (from-scratch bounded slow-headers client) ────────────────────
+  - threat_class: volumetric_ddos
+    tool: ddos
+    mode: lab
+    attack: slowloris
+    target: sentinel-lab-target
+    iface: lo
+    port: 80
+    max_sockets: 100
+    duration: 20
+
+  # ── DNS tunnelling (dnscat2/iodine client against the lab DNS server) ────────
+  - threat_class: dga_dns_tunneling
+    tool: dns_tunneling
+    mode: lab
+    attack: dns_tunnel
+    target: sentinel-lab-target
+    iface: lo
+    port: 53
+    domain: tunnel.sentinel-lab
+    duration: 20
+
+  # ── DGA beaconing (from-scratch DGA domains queried at the lab DNS) ──────────
+  - threat_class: dga_dns_tunneling
+    tool: dns_tunneling
+    mode: lab
+    attack: dga
+    target: sentinel-lab-target
+    iface: lo
+    port: 53
+    count: 300
+    algo: all
+    duration: 20

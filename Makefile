@@ -116,3 +116,18 @@ clean: ## Remove __pycache__, .pytest_cache, and prompt before removing .venv
 	find . -type d -name "__pycache__" -exec rm -rf {} +
 	rm -rf .pytest_cache
 	@read -p "Remove virtualenv directory (.venv)? [y/N] " confirm && [ "$$confirm" = "y" -o "$$confirm" = "Y" ] && rm -rf .venv || echo "Skipped .venv removal"
+
+# ── Lab traffic generation (REAL packets) ─────────────────────────────────────
+# Appended for the lab traffic-gen harness. Unlike `gen-data` (mock, CI-safe),
+# this target executes the real generators against a lab endpoint you control.
+.PHONY: gen-data-lab
+gen-data-lab: ## Generate REAL lab traffic from lab_ddos.yaml (lab network ONLY)
+	@echo "############################################################"
+	@echo "# WARNING: gen-data-lab generates REAL network traffic"
+	@echo "# (hping3 floods, slowloris, DNS tunnelling/DGA queries)."
+	@echo "# Run it ONLY inside your lab compose network, against a"
+	@echo "# target you own. Edit the 'target' fields in"
+	@echo "# igu_sentinel/traffic_gen/config/lab_ddos.yaml first."
+	@echo "# hping3 floods require root; install tshark/hping3/iperf3."
+	@echo "############################################################"
+	bash -c "source .venv/bin/activate && python -m igu_sentinel.traffic_gen.runner igu_sentinel/traffic_gen/config/lab_ddos.yaml"
