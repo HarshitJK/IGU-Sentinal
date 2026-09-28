@@ -17,7 +17,6 @@ RUN pip install --no-cache-dir --default-timeout=600 -r requirements.lock
 
 # Copy application code
 COPY igu_sentinel/ /app/igu_sentinel/
-COPY tests/fixtures/ /app/tests/fixtures/
 # Trained model artifacts. Without these the service starts but every scoring
 # call raises "model not available" — the detectors load from models/ at import.
 COPY models/ /app/models/

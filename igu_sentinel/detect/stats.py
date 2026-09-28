@@ -1,15 +1,23 @@
 """Z-score baseline anomaly detection."""
 import math
+import threading
 from typing import Optional
 from igu_sentinel.schemas import FlowRecord, LayerScore
 
 
-# Global baseline statistics (trained on benign traffic)
+# Global baseline statistics (trained on benign traffic).
+# Access must be protected by _baseline_lock: train_stats_baseline() writes it
+# while detect_stats() reads it, and both can be called from different threads
+# (e.g. a retrain worker running alongside the pipeline's ingest threads).
 _baseline: Optional[dict] = None
+_baseline_lock: threading.RLock = threading.RLock()
 
 
 def train_stats_baseline(benign_flows: list[FlowRecord]) -> None:
     """Train z-score baseline on benign flows.
+
+    Thread-safe: acquires _baseline_lock before replacing the baseline so that
+    an in-progress detect_stats() call always sees a consistent snapshot.
 
     Args:
         benign_flows: List of benign FlowRecords to compute baseline statistics
@@ -45,7 +53,7 @@ def train_stats_baseline(benign_flows: list[FlowRecord]) -> None:
         std = math.sqrt(variance) if variance > 0 else 1.0
         return mean, std
 
-    _baseline = {
+    new_baseline = {
         "inter_arrival_mean": compute_stats(inter_arrivals),
         "packet_size_mean": compute_stats(packet_sizes),
         "entropy": compute_stats(entropies),
@@ -53,10 +61,15 @@ def train_stats_baseline(benign_flows: list[FlowRecord]) -> None:
         "ttl": compute_stats(ttls),
         "fanout_count": compute_stats(fanouts) if fanouts else (1.0, 1.0),
     }
+    with _baseline_lock:
+        _baseline = new_baseline
 
 
 def detect_stats(flow: FlowRecord) -> LayerScore:
     """Detect anomalies using z-score baseline.
+
+    Thread-safe: acquires _baseline_lock so the baseline dict cannot be swapped
+    mid-read by a concurrent train_stats_baseline() call.
 
     Computes z-scores for various flow features against the trained baseline.
     Combines them into a composite anomaly score.
@@ -67,42 +80,44 @@ def detect_stats(flow: FlowRecord) -> LayerScore:
     Returns:
         LayerScore with raw_score and calibrated_probability
     """
-    if _baseline is None:
+    with _baseline_lock:
+        baseline_snapshot = _baseline
+    if baseline_snapshot is None:
         raise RuntimeError("Must call train_stats_baseline() before detect_stats()")
 
     z_scores = []
     evidence = []
 
     # Compute z-score for inter-arrival time
-    mean, std = _baseline["inter_arrival_mean"]
+    mean, std = baseline_snapshot["inter_arrival_mean"]
     z = abs((flow.inter_arrival_stats["mean"] - mean) / std)
     z_scores.append(z)
     if z > 2:
         evidence.append(f"unusual_inter_arrival_time (z={z:.2f})")
 
     # Compute z-score for packet size
-    mean, std = _baseline["packet_size_mean"]
+    mean, std = baseline_snapshot["packet_size_mean"]
     z = abs((flow.packet_size_stats["mean"] - mean) / std)
     z_scores.append(z)
     if z > 2:
         evidence.append(f"unusual_packet_size (z={z:.2f})")
 
     # Compute z-score for entropy
-    mean, std = _baseline["entropy"]
+    mean, std = baseline_snapshot["entropy"]
     z = abs((flow.entropy - mean) / std)
     z_scores.append(z)
     if z > 2:
         evidence.append(f"unusual_entropy (z={z:.2f})")
 
     # Compute z-score for byte ratio
-    mean, std = _baseline["byte_ratio"]
+    mean, std = baseline_snapshot["byte_ratio"]
     z = abs((flow.byte_ratio - mean) / std)
     z_scores.append(z)
     if z > 2:
         evidence.append(f"unusual_byte_ratio (z={z:.2f})")
 
     # Compute z-score for TTL
-    mean, std = _baseline["ttl"]
+    mean, std = baseline_snapshot["ttl"]
     z = abs((flow.ttl - mean) / std)
     z_scores.append(z)
     if z > 2:
@@ -110,7 +125,7 @@ def detect_stats(flow: FlowRecord) -> LayerScore:
 
     # Compute z-score for fanout (if present)
     if flow.fanout_count:
-        mean, std = _baseline["fanout_count"]
+        mean, std = baseline_snapshot["fanout_count"]
         z = abs((flow.fanout_count - mean) / std)
         z_scores.append(z)
         if z > 2:

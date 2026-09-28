@@ -157,15 +157,58 @@ def docker_available() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def tshark_available() -> bool:
+    """True only when the tshark binary is installed and responsive.
+
+    Tests that actually *invoke* tshark as a subprocess (not tests that merely
+    mock it) must be gated on this so a missing tool produces a clear skip
+    message rather than a cryptic FileNotFoundError or AssertionError.
+    """
+    if not shutil.which("tshark"):
+        return False
+    try:
+        return subprocess.run(
+            ["tshark", "-v"],
+            capture_output=True,
+            timeout=10,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# Tests that *call the real tshark binary* (not tests that mock it).  A missing
+# tshark binary is an environment gap, not a code defect — skip with a clear
+# message rather than FAIL.
+_TSHARK_REQUIRED_TESTS = {
+    "test_tshark_available",
+    "test_extract_ja4_from_pcap_tls",
+    "test_build_capture_extracts_flows_through_real_pipeline",
+    "test_ddos_udp_scenario_has_large_pkt_rate",
+}
+
+
 def pytest_collection_modifyitems(config, items):
-    """Skip container-stack tests when Docker is unavailable."""
-    if docker_available():
-        return
-    reason = (
+    """Skip container-stack tests when Docker is unavailable.
+    Skip real-tshark tests when tshark is not installed.
+    """
+    docker_ok = docker_available()
+    tshark_ok = tshark_available()
+
+    docker_reason = (
         "Docker unavailable (needs the docker CLI, a running daemon, and either "
         "`docker compose` or `docker-compose`)"
     )
-    skip = pytest.mark.skip(reason=reason)
+    tshark_reason = (
+        "tshark not installed — install with `sudo apt-get install -y tshark` "
+        "on Linux, or the Wireshark installer on Windows, then re-run"
+    )
+
+    skip_docker = pytest.mark.skip(reason=docker_reason)
+    skip_tshark = pytest.mark.skip(reason=tshark_reason)
+
     for item in items:
-        if item.name in _DOCKER_RUNTIME_TESTS:
-            item.add_marker(skip)
+        if not docker_ok and item.name in _DOCKER_RUNTIME_TESTS:
+            item.add_marker(skip_docker)
+        if not tshark_ok and item.name in _TSHARK_REQUIRED_TESTS:
+            item.add_marker(skip_tshark)

@@ -55,7 +55,7 @@ def run_traffic_gen(config_path: str, allow_lab: bool = False) -> List[Dict[str,
         List of {threat_class, flow} dicts for each generated flow.
     """
     config_path = Path(config_path)
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     labeled_flows = []

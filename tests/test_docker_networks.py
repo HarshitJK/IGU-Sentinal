@@ -5,17 +5,27 @@ from pathlib import Path
 import yaml
 
 
-def run_docker_command(cmd):
-    """Run a docker command and return stdout."""
+def run_docker_command(cmd: list[str]) -> str:
+    """Run a docker command (argument list) and return stdout."""
     result = subprocess.run(
         cmd,
-        shell=True,
         capture_output=True,
         text=True,
-        timeout=30
+        timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(f"Docker command failed: {cmd}\nstderr: {result.stderr}")
+    return result.stdout.strip()
+
+
+def run_docker_command_optional(cmd: list[str]) -> str:
+    """Run a docker command that is allowed to fail (e.g. 'network rm' on a missing network)."""
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
     return result.stdout.strip()
 
 
@@ -58,18 +68,17 @@ def test_networks_defined_in_compose():
 
 def test_networks_can_be_created():
     """Docker networks should be creatable with the defined config."""
-    # Create the networks directly using docker network create
     try:
-        # Create prod-net
-        output = run_docker_command("docker network create -d bridge prod-net 2>&1 || true")
+        # Create prod-net (ignore error if it already exists)
+        run_docker_command_optional(["docker", "network", "create", "-d", "bridge", "prod-net"])
         print(f"✓ prod-net creation attempted")
 
-        # Create enclave-net
-        output = run_docker_command("docker network create -d bridge enclave-net 2>&1 || true")
+        # Create enclave-net (ignore error if it already exists)
+        run_docker_command_optional(["docker", "network", "create", "-d", "bridge", "enclave-net"])
         print(f"✓ enclave-net creation attempted")
 
         # Verify networks exist
-        output = run_docker_command("docker network ls --format json")
+        output = run_docker_command(["docker", "network", "ls", "--format", "json"])
         networks = [json.loads(line) for line in output.split('\n') if line.strip()]
         network_names = {n['Name'] for n in networks}
 
@@ -80,10 +89,10 @@ def test_networks_can_be_created():
         print(f"  All networks: {sorted(network_names)}")
 
     finally:
-        # Clean up created networks
+        # Clean up created networks (ignore errors on missing networks)
         try:
-            run_docker_command("docker network rm prod-net 2>&1 || true")
-            run_docker_command("docker network rm enclave-net 2>&1 || true")
+            run_docker_command_optional(["docker", "network", "rm", "prod-net"])
+            run_docker_command_optional(["docker", "network", "rm", "enclave-net"])
             print("✓ Cleanup complete")
         except Exception as e:
             print(f"Warning: cleanup failed: {e}")
@@ -94,3 +103,4 @@ if __name__ == "__main__":
     test_networks_defined_in_compose()
     test_networks_can_be_created()
     print("\n✓ All Docker network tests passed")
+

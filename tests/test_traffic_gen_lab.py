@@ -286,7 +286,7 @@ def test_runner_rejects_lab_mode_on_non_lab_tool():
 # ── Shipped lab config sanity ─────────────────────────────────────────────────
 def test_lab_config_targets_are_all_lab_endpoints():
     cfg = Path("igu_sentinel/traffic_gen/config/lab_ddos.yaml")
-    with open(cfg) as f:
+    with open(cfg, encoding="utf-8") as f:
         data = yaml.safe_load(f)
     variants = data["variants"]
     assert variants, "lab_ddos.yaml should define variants"
