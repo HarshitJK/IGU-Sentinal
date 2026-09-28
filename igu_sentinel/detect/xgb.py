@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional, List
 
 from igu_sentinel.schemas import FlowRecord, LayerScore
-from igu_sentinel.detect.features import extract_features, FEATURE_DIM
+from igu_sentinel.detect.features import extract_features, FEATURE_DIM, _FEATURE_CONTRACT_VERSION
 # Shared with isoforest so there is one definition of how an artifact is
 # pinned and how its digest is checked.
 from igu_sentinel.detect.isoforest import _pinned_model_name, verify_artifact
@@ -141,9 +141,20 @@ def _load_model_from_disk() -> bool:
             return False
         model = xgb.XGBClassifier()
         model.load_model(str(resolved))
+        if model.get_booster().num_features() != FEATURE_DIM:
+            log.error("xgb: feature dimension mismatch — refusing artifact")
+            return False
         if label_path.exists():
+            if label_path.resolve().parent != _MODELS_DIR.resolve() or not verify_artifact(label_path):
+                return False
             with open(label_path) as fh:
-                label_encoder = _json.load(fh)
+                raw_labels = _json.load(fh)
+            # Strip metadata keys and convert string integer keys back to ints.
+            label_encoder = {
+                int(k): v
+                for k, v in raw_labels.items()
+                if not k.startswith("_") and str(k).lstrip("-").isdigit()
+            }
         else:
             label_encoder = {i: c for i, c in enumerate(THREAT_CLASSES)}
 
@@ -152,6 +163,24 @@ def _load_model_from_disk() -> bool:
             log.error(
                 "xgb: %s maps to unknown classes %s — refusing to load",
                 label_path.name, sorted(unknown),
+            )
+            return False
+
+        # Check feature contract version stored in labels file.
+        stored_ver = 1
+        if label_path.exists():
+            try:
+                with open(label_path) as _fh:
+                    _meta = _json.load(_fh)
+                    if isinstance(_meta, dict):
+                        stored_ver = _meta.get("_feature_contract_version", 1)
+            except Exception:
+                pass
+        if int(stored_ver) != _FEATURE_CONTRACT_VERSION:
+            log.error(
+                "xgb: %s was trained on feature contract v%s but this build "
+                "uses v%d — refusing to load incompatible artifact",
+                model_path.name, stored_ver, _FEATURE_CONTRACT_VERSION,
             )
             return False
 
@@ -224,7 +253,7 @@ def train_xgb(flows: list[FlowRecord], labels: list[str]) -> None:
     # were still being passed, implying a version constraint that no longer
     # applies.
     model = xgb.XGBClassifier(
-        objective="multi:softprob",
+        objective="binary:logistic" if num_classes == 2 else "multi:softprob",
         n_estimators=200,
         max_depth=6,
         learning_rate=0.1,
@@ -244,8 +273,10 @@ def train_xgb(flows: list[FlowRecord], labels: list[str]) -> None:
     label_path = model_path.with_suffix(".labels.json")
 
     model.save_model(str(model_path))
+    label_data = {str(k): v for k, v in int_to_label.items()}
+    label_data["_feature_contract_version"] = _FEATURE_CONTRACT_VERSION
     with open(label_path, "w") as fh:
-        _json.dump(int_to_label, fh)
+        _json.dump(label_data, fh)
 
     log.info("xgb: saved %s (classes=%s, n=%d)", model_path.name, ordered, len(flows))
 

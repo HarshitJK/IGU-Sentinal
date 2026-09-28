@@ -3,6 +3,30 @@
 The repository is a working prototype, not a validated production detector.
 This report supersedes readiness and performance claims in older documents.
 
+## Feature migration update
+
+The partially implemented v2 contract has been corrected and staged. Default
+serving remains v1 (16 features) with the pinned models. Set
+`IGU_FEATURE_CONTRACT_VERSION=2` before starting a training/evaluation process
+to select the 27-feature candidate contract. Existing v1 artifacts are rejected
+in that mode; do not enable it in the demo until compatible models are trained,
+evaluated and explicitly pinned. No replacement serving artifacts were created.
+
+New measurements include fixed-window packet/byte rates, SYN counts, source
+entropy across packets targeting the same destination/service, and paired
+directional volumes within each window. Configure `IGU_PROTECTED_CIDRS` to
+identify inside/outside traffic. An unobserved reverse direction stays null.
+DNS query length now reaches the model vector; TXT is a categorical indicator,
+not a measured fraction. SYN and DNS extraction handle nested tshark fields.
+
+Regression tests cover those measurements, v2 rejection of legacy models, and
+isolated v2 training/reload. Fixture training in these tests proves software
+compatibility only. Missing feature values in legacy fixtures are not measured
+training data. The flood/exfiltration classification failure remains unresolved
+until a representative v2 dataset and models are validated. A 1ms DDoS fixture
+interval is not inherently wrong; DDoS rates vary, and matching one lab example
+is not a valid reason to relabel or reshape all training data.
+
 ## Verified fixes
 
 - The dashboard no longer embeds the API secret. Operators sign in using an
@@ -27,7 +51,7 @@ This report supersedes readiness and performance claims in older documents.
 
 ## Checks completed
 
-- Backend: **225 passed, 12 skipped** with `SKIP_DOCKER_TESTS=1`. Docker checks
+- Backend: **231 passed, 12 skipped** with `SKIP_DOCKER_TESTS=1`. Docker checks
   are separate; skipped tests must not be counted as verified.
 - React production build: passed.
 - Docker diode proof: forward ACCEPT and reverse DROP counters increased;

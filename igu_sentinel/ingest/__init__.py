@@ -8,8 +8,21 @@ Two capture sources, one shared flow-construction path:
 Both feed the identical _build_flow_records() helper, so feature extraction is
 never duplicated: the only difference is how packets arrive (a finished file vs.
 a live tshark stream) and, for the live path, the fixed-window batching.
+
+Feature contract v2 additions extracted here:
+  pkt_rate / byte_rate        — packets and bytes per second in window.
+  syn_count / syn_fraction    — TCP SYN packets; distinguishes SYN floods.
+  src_ip_entropy              — Shannon entropy of source IPs per window;
+                                near 0 for single-source, high for spoofed.
+  outbound_bytes / inbound_bytes — directional byte volumes; None when not
+                                observable (uses PROTECTED_NETWORK_CIDRS).
+  dns_query_len               — mean label length for DNS queries.
+  dns_record_type             — most common DNS record type in window.
 """
+import ipaddress
 import json
+import math
+import os
 import queue
 import subprocess
 import threading
@@ -18,12 +31,27 @@ import hashlib
 import struct
 import tempfile
 import socket
-from collections import defaultdict, deque, OrderedDict
+from collections import Counter, defaultdict, deque, OrderedDict
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Iterable, Iterator, Optional
 from statistics import mean, stdev
 from igu_sentinel.schemas import FlowRecord
 from igu_sentinel.ingest.ja4 import compute_ja4, parse_tshark_fields_line
+
+# ── Protected-network CIDR configuration ─────────────────────────────────────
+# Set via IGU_PROTECTED_CIDRS env var (comma-separated CIDR notation).
+# Used to determine traffic direction for outbound_bytes / inbound_bytes.
+# Example: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+# If not set (default), directional bytes are None (unknown).
+_PROTECTED_CIDRS_RAW = os.environ.get("IGU_PROTECTED_CIDRS", "")
+PROTECTED_NETWORKS = []
+for _cidr in _PROTECTED_CIDRS_RAW.split(","):
+    _cidr = _cidr.strip()
+    if _cidr:
+        try:
+            PROTECTED_NETWORKS.append(ipaddress.ip_network(_cidr, strict=False))
+        except ValueError as exc:
+            raise ValueError(f"Invalid IGU_PROTECTED_CIDRS entry: {_cidr!r}") from exc
 
 
 # Fixed 120ms capture window (locked in CLAUDE.md — deliberately NOT adaptive).
@@ -344,6 +372,84 @@ def _get_dns_names(packet: Dict[str, Any]) -> List[str]:
     return list(raw) if isinstance(raw, list) else [raw]
 
 
+def _get_dns_record_type(packet: Dict[str, Any]) -> Optional[str]:
+    """Extract the DNS query record type string (A, AAAA, TXT, MX, …).
+
+    Returns None for non-DNS packets or when the type cannot be decoded.
+    tshark exposes dns.qry.type as a decimal integer; we convert common values.
+    """
+    _DNS_TYPE_MAP = {
+        "1": "A", "28": "AAAA", "5": "CNAME", "15": "MX",
+        "16": "TXT", "2": "NS", "6": "SOA", "12": "PTR",
+        "33": "SRV", "255": "ANY",
+    }
+    layers = packet.get("_source", {}).get("layers", {})
+    dns = layers.get("dns")
+    if not dns:
+        return None
+    def query_type(node):
+        if isinstance(node, dict):
+            if "dns.qry.type" in node:
+                return node["dns.qry.type"]
+            for value in node.values():
+                found = query_type(value)
+                if found is not None:
+                    return found
+        elif isinstance(node, list):
+            for value in node:
+                found = query_type(value)
+                if found is not None:
+                    return found
+        return None
+    raw = query_type(dns)
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    return _DNS_TYPE_MAP.get(str(raw), str(raw)) if raw is not None else None
+
+
+def _is_tcp_syn(packet: Dict[str, Any]) -> bool:
+    """Return True if this packet is a TCP SYN (and not SYN-ACK)."""
+    layers = packet.get("_source", {}).get("layers", {})
+    tcp = layers.get("tcp")
+    if not tcp:
+        return False
+    flags_raw = tcp.get("tcp.flags") or tcp.get("tcp_flags")
+    if flags_raw is None:
+        tree = tcp.get("tcp.flags_tree", tcp)
+        return str(tree.get("tcp.flags.syn")) == "1" and str(tree.get("tcp.flags.ack", "0")) == "0"
+    try:
+        flags = int(str(flags_raw), 16) if str(flags_raw).startswith("0x") else int(flags_raw, 16)
+    except (ValueError, TypeError):
+        try:
+            flags = int(flags_raw)
+        except (ValueError, TypeError):
+            return False
+    # SYN=0x02, ACK=0x10; a SYN-ACK has both set — only pure SYN counts here.
+    return bool(flags & 0x02) and not bool(flags & 0x10)
+
+
+def _ip_in_protected(ip_str: str) -> bool:
+    """Return True if ip_str falls within any configured PROTECTED_NETWORKS."""
+    if not PROTECTED_NETWORKS:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return any(addr in net for net in PROTECTED_NETWORKS)
+    except ValueError:
+        return False
+
+
+def _shannon_entropy_of_strings(items: List[str]) -> float:
+    """Shannon entropy of a collection of strings (0 for empty or single unique)."""
+    if not items:
+        return 0.0
+    counts = Counter(items)
+    total = len(items)
+    return -sum((c / total) * math.log2(c / total) for c in counts.values() if c > 0)
+
+
 def _extract_ja4_map(pcap_path: str) -> Dict[Tuple[str, int, str, int, str], str]:
     """Extract JA4 fingerprints for TLS/QUIC Client Hello handshakes from pcap.
 
@@ -459,7 +565,7 @@ class PacketWindow:
         if self.bucket is not None:
             self.last_bucket = self.bucket
         self.bucket = None
-        return _build_flow_records(packets, _ja4_from_packets(packets), state=self.state)
+        return _build_flow_records(packets, _ja4_from_packets(packets), state=self.state, window_ms=self.window_ms)
 
 
 def flow_windows_from_packets(packets, window_ms=DEFAULT_WINDOW_MS):
@@ -476,6 +582,7 @@ def _build_flow_records(
     packets: List[Dict[str, Any]],
     ja4_map: Optional[Dict[Tuple[str, int, str, int, str], str]] = None,
     state=None,
+    window_ms=DEFAULT_WINDOW_MS,
 ) -> List[FlowRecord]:
     """Group tshark packet dicts into flows and build FlowRecords.
 
@@ -504,6 +611,7 @@ def _build_flow_records(
 
     for packet in packets:
         flow_key = _get_flow_key(packet)
+        src_ip_pkt = flow_key[0]
         packet_size = _get_packet_size(packet)
         ttl = _get_ttl(packet)
         payload = _get_payload(packet)
@@ -517,6 +625,10 @@ def _build_flow_records(
             "payload": payload,
             "timestamp": timestamp,
             "dns_names": _get_dns_names(packet),
+            # v2 additions per packet
+            "is_syn": _is_tcp_syn(packet),
+            "dns_record_type": _get_dns_record_type(packet),
+            "src_ip": src_ip_pkt,
         })
         packet_times[flow_key].append(timestamp)
 
@@ -533,6 +645,10 @@ def _build_flow_records(
     targets_by_source: Dict[str, set] = defaultdict(set)
     for (f_src_ip, _f_sport, f_dst_ip, f_dst_port, _f_proto) in flows_data:
         targets_by_source[f_src_ip].add((f_dst_ip, f_dst_port))
+
+    sources_by_target = defaultdict(list)
+    for (source, _, destination, port, proto), observations in flows_data.items():
+        sources_by_target[(destination, port, proto)].extend([source] * len(observations))
 
     # Create FlowRecord for each flow
     flow_records = []
@@ -632,6 +748,56 @@ def _build_flow_records(
             else:
                 del state.fingerprints[flow_key]
 
+        # ── v2 feature extraction ─────────────────────────────────────────────
+        n_packets = len(packets_info)
+
+        # Denominator is the configured observation window, not burst spacing.
+        span_s = window_ms / 1000.0
+        pkt_rate = n_packets / span_s
+        byte_rate = total_bytes / span_s
+
+        # SYN statistics (TCP only).
+        syn_count = sum(1 for p in packets_info if p.get("is_syn", False))
+        syn_fraction = syn_count / n_packets if n_packets > 0 else 0.0
+
+        # Aggregate sources targeting the same destination/service in this window.
+        src_ip_entropy = _shannon_entropy_of_strings(
+            sources_by_target[(dst_ip, dst_port, protocol)])
+
+        # Directional byte volumes — only computable when PROTECTED_NETWORKS is set.
+        # outbound = bytes leaving protected network; inbound = bytes entering.
+        outbound_bytes_val: Optional[int] = None
+        inbound_bytes_val: Optional[int] = None
+        if PROTECTED_NETWORKS:
+            src_protected = _ip_in_protected(src_ip)
+            dst_protected = _ip_in_protected(dst_ip)
+            if src_protected and not dst_protected:
+                # Flow goes from inside to outside — it's outbound.
+                outbound_bytes_val = total_bytes
+                reverse = flows_data.get((dst_ip, dst_port, src_ip, src_port, protocol))
+                inbound_bytes_val = sum(p["size"] for p in reverse) if reverse else None
+            elif dst_protected and not src_protected:
+                # Flow goes from outside to inside — it's inbound.
+                inbound_bytes_val = total_bytes
+                reverse = flows_data.get((dst_ip, dst_port, src_ip, src_port, protocol))
+                outbound_bytes_val = sum(p["size"] for p in reverse) if reverse else None
+            # else: both or neither protected — direction ambiguous, leave as None
+
+        # DNS query features.
+        dns_names_all = [n for p in packets_info for n in p.get("dns_names", [])]
+        dns_query_len_val: Optional[float] = None
+        if dns_names_all:
+            label_lengths = [
+                float(sum(len(label) for label in name.split("."))) / max(1, name.count(".") + 1)
+                for name in dns_names_all
+            ]
+            dns_query_len_val = mean(label_lengths)
+
+        dns_types = [p.get("dns_record_type") for p in packets_info if p.get("dns_record_type")]
+        dns_record_type_val: Optional[str] = None
+        if dns_types:
+            dns_record_type_val = Counter(dns_types).most_common(1)[0][0]
+
         # Create FlowRecord
         flow_record = FlowRecord(
             flow_id=flow_id,
@@ -657,6 +823,16 @@ def _build_flow_records(
             # cross-window horizon, not just this 120ms window. Window-local
             # counting let a scanner evade the threshold purely by pacing.
             fanout_count=max(fanout, len(targets_by_source.get(src_ip, ())) or 1),
+            # ── v2 fields ─────────────────────────────────────────────────────
+            pkt_rate=pkt_rate,
+            byte_rate=byte_rate,
+            syn_count=syn_count,
+            syn_fraction=syn_fraction,
+            src_ip_entropy=src_ip_entropy,
+            outbound_bytes=outbound_bytes_val,
+            inbound_bytes=inbound_bytes_val,
+            dns_query_len=dns_query_len_val,
+            dns_record_type=dns_record_type_val,
         )
 
         flow_records.append(flow_record)

@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 from igu_sentinel.schemas import FlowRecord, LayerScore
-from igu_sentinel.detect.features import extract_features, FEATURE_DIM
+from igu_sentinel.detect.features import extract_features, FEATURE_DIM, _FEATURE_CONTRACT_VERSION
 
 log = logging.getLogger(__name__)
 
@@ -185,11 +185,19 @@ def _load_model_from_disk() -> bool:
             log.error("isoforest: %s is not a valid model bundle", path.name)
             return False
         dim = bundle.get("feature_dim")
-        if dim is not None and int(dim) != FEATURE_DIM:
+        if int(dim if dim is not None else bundle["model"].n_features_in_) != FEATURE_DIM:
             log.error(
                 "isoforest: %s was trained on %s features but this build extracts %d "
                 "— refusing to load (scores would be meaningless)",
                 path.name, dim, FEATURE_DIM,
+            )
+            return False
+        stored_ver = bundle.get("feature_contract_version", 1)
+        if int(stored_ver) != _FEATURE_CONTRACT_VERSION:
+            log.error(
+                "isoforest: %s was trained on feature contract v%s but this build "
+                "uses v%d — refusing to load incompatible artifact",
+                path.name, stored_ver, _FEATURE_CONTRACT_VERSION,
             )
             return False
         _swap_state(
@@ -288,6 +296,7 @@ def train_isoforest(benign_flows: list[FlowRecord]) -> None:
         "df_scale": df_scale,
         "n_train": len(benign_flows),
         "feature_dim": FEATURE_DIM,
+        "feature_contract_version": _FEATURE_CONTRACT_VERSION,
     }
     joblib.dump(bundle, save_path)
     log.info("isoforest: saved %s (trained on %d flows)", save_path.name, len(benign_flows))
