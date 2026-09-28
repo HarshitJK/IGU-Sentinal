@@ -20,9 +20,12 @@ import yaml
 
 from igu_sentinel.schemas import FlowRecord
 from igu_sentinel.traffic_gen.lab import (
+    beaconing,
     benign,
     dga,
     dns_tunnel,
+    encrypted_malware,
+    exfiltration,
     slowloris,
     synflood,
     udpflood,
@@ -31,8 +34,8 @@ from igu_sentinel.traffic_gen.lab._guard import is_lab_target, validate_lab_targ
 from igu_sentinel.traffic_gen.lab._tools import LabToolMissing
 
 # Every module exposing run(target, duration, **params) -> Path.
-LAB_MODULES = [synflood, udpflood, slowloris, dga, dns_tunnel, benign]
-LAB_MODULE_IDS = ["synflood", "udpflood", "slowloris", "dga", "dns_tunnel", "benign"]
+LAB_MODULES = [synflood, udpflood, slowloris, dga, dns_tunnel, benign, beaconing, exfiltration, encrypted_malware]
+LAB_MODULE_IDS = ["synflood", "udpflood", "slowloris", "dga", "dns_tunnel", "benign", "beaconing", "exfiltration", "encrypted_malware"]
 
 PUBLIC_TARGETS = [
     "8.8.8.8",

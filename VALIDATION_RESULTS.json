@@ -1,5 +1,15 @@
 {
   "date": "2026-09-28",
+  "revision": "2",
+  "hygiene_changes_2026_09_28": {
+    "dockerfile_test_fixtures_removed": true,
+    "docker_networks_test_shell_true_removed": true,
+    "stats_baseline_thread_lock_added": "threading.RLock in detect/stats.py; regression test in test_stats.py::test_stats_baseline_thread_safe",
+    "unserved_models_archived": "69 files moved to models/archive/; isoforest_v18.pkl and xgb_v15.json remain in root",
+    "tshark_skip_gating": "test_tshark_available, test_extract_ja4_from_pcap_tls, test_build_capture_extracts_flows_through_real_pipeline, test_ddos_udp_scenario_has_large_pkt_rate now skip with clear message when tshark absent",
+    "lab_ddos_yaml_encoding": "runner.py and test_traffic_gen_lab.py now open lab_ddos.yaml with encoding=utf-8",
+    "build_training_captures_shim_retained": "tests/test_training_pipeline.py imports it at 3 call sites; shim not removed"
+  },
   "backend_tests": {
     "passed": 257,
     "skipped": 12,

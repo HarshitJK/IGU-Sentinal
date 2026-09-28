@@ -19,19 +19,25 @@ def test_dockerfile_exists_and_valid():
     assert "python:3.12-slim" in content, "Served XGBoost model requires Python 3.12+"
     assert "requirements.txt" in content, "Must copy requirements.txt"
     assert "igu_sentinel" in content, "Must copy igu_sentinel module"
-    assert "tests/fixtures" in content, "Must copy test fixtures"
+    # Production image must NOT bundle test fixtures — they are test-only data
+    # and must not ship in the production container (Task 8 / CLAUDE.md contract).
+    assert "tests/fixtures" not in content, (
+        "Production Dockerfile must not COPY tests/fixtures: "
+        "test data must not be bundled in the production image"
+    )
     assert "uvicorn" in content, "Must use uvicorn to run app"
     assert "igu_sentinel.api:app" in content, "Must reference FastAPI app"
     assert "8000" in content, "Must expose port 8000"
     assert "/ready" in content, "Container health must verify scoring readiness"
 
     print("✓ Dockerfile has all required components:")
-    print("  - Base image: python:3.11-slim")
+    print("  - Base image: python:3.12-slim")
     print("  - Dependencies: requirements.txt")
     print("  - Code: igu_sentinel module")
-    print("  - Fixtures: test data")
+    print("  - No test fixtures: production image is clean of test data")
     print("  - App: FastAPI via uvicorn on port 8000")
-    print("  - Health check: /health endpoint")
+    print("  - Health check: /ready endpoint")
+
 
 
 def test_docker_compose_yaml_valid():
