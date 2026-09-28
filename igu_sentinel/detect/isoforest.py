@@ -20,6 +20,7 @@ Model lifecycle:
 
 import hmac
 import math
+import os
 import logging
 import threading
 from pathlib import Path
@@ -31,7 +32,7 @@ from igu_sentinel.detect.features import extract_features, FEATURE_DIM, _FEATURE
 log = logging.getLogger(__name__)
 
 # ── model storage ────────────────────────────────────────────────────────────
-_MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
+_MODELS_DIR = Path(os.environ.get("IGU_MODELS_DIR", Path(__file__).resolve().parents[2] / "models"))
 _MODEL_STEM = "isoforest_v"
 
 # ── in-memory state ──────────────────────────────────────────────────────────
@@ -105,6 +106,25 @@ def _pinned_model_name(key: str) -> Optional[str]:
     return None
 
 
+_artifact_lock = threading.Lock()
+
+
+def record_artifact_digests(paths: list[Path]) -> None:
+    """Register artifacts produced by explicit training, with atomic manifest update."""
+    import hashlib
+    import json
+    import os
+    import tempfile
+    with _artifact_lock:
+        manifest = paths[0].parent / _MANIFEST
+        entries = json.loads(manifest.read_text()) if manifest.exists() else {}
+        entries.update({path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths})
+        with tempfile.NamedTemporaryFile(mode="w", dir=manifest.parent, delete=False) as out:
+            json.dump(entries, out, indent=2)
+            temporary = out.name
+        os.replace(temporary, manifest)
+
+
 def verify_artifact(path: Path) -> bool:
     """Check ``path`` against models/MANIFEST.json before it is deserialized.
 
@@ -114,13 +134,13 @@ def verify_artifact(path: Path) -> bool:
     manifest exists, an artifact missing from it (or whose digest does not
     match) is refused.
 
-    No manifest means no enforcement, which keeps a fresh checkout working;
-    train_models.py writes one, and a deployment should ship it.
+    Missing manifests fail closed. Digests detect corruption; they are not
+    signatures and do not protect against a writer who can replace both files.
     """
-    manifest_path = _MODELS_DIR / _MANIFEST
+    manifest_path = path.parent / _MANIFEST
     if not manifest_path.exists():
-        log.debug("no %s — artifact digests not enforced", _MANIFEST)
-        return True
+        log.error("no %s — refusing unverified artifact", _MANIFEST)
+        return False
     try:
         import json as _json
         expected = _json.loads(manifest_path.read_text()).get(path.name)
@@ -151,7 +171,8 @@ def _latest_model_path() -> Optional[Path]:
         candidate = _MODELS_DIR / pinned
         if candidate.exists() and candidate.resolve().parent == _MODELS_DIR.resolve():
             return candidate
-        log.error("models/CURRENT pins %r which is missing — falling back", pinned)
+        log.error("models/CURRENT pins %r which is missing — refusing fallback", pinned)
+        return None
     existing = _model_files()
     return existing[-1] if existing else None
 
@@ -191,6 +212,9 @@ def _load_model_from_disk() -> bool:
                 "— refusing to load (scores would be meaningless)",
                 path.name, dim, FEATURE_DIM,
             )
+            return False
+        if bundle["model"].n_features_in_ != FEATURE_DIM or bundle["scaler"].n_features_in_ != FEATURE_DIM:
+            log.error("isoforest: actual model/scaler dimensions disagree with the feature contract")
             return False
         stored_ver = bundle.get("feature_contract_version", 1)
         if int(stored_ver) != _FEATURE_CONTRACT_VERSION:
@@ -232,18 +256,8 @@ _load_model_from_disk()
 
 # ── public API ────────────────────────────────────────────────────────────────
 
-def train_isoforest(benign_flows: list[FlowRecord]) -> None:
-    """Fit IsolationForest on benign-only flows and persist model to disk.
-
-    Args:
-        benign_flows: List of FlowRecords confirmed benign (from fused verdict,
-            not self-assessed by isoforest alone — see CLAUDE.md anti-poisoning
-            constraint).
-
-    Raises:
-        ValueError: If benign_flows is empty.
-        ImportError: If scikit-learn or joblib are not installed.
-    """
+def fit_candidate(benign_flows: list[FlowRecord]) -> tuple:
+    """Fit an isolated candidate; never persist or modify serving state."""
     if not benign_flows:
         raise ValueError("Must provide at least one benign flow to train on.")
 
@@ -286,23 +300,27 @@ def train_isoforest(benign_flows: list[FlowRecord]) -> None:
     # 95th percentile of benign distribution: scores above this indicate true anomalies
     platt_b = float(np.percentile(raw_benign, 95))
 
-    # Persist (versioned — never overwrites previous).
-    version = _next_version()
-    save_path = _MODELS_DIR / f"{_MODEL_STEM}{version}.pkl"
-    bundle = {
-        "model": model,
-        "scaler": scaler,
-        "platt_b": platt_b,
-        "df_scale": df_scale,
-        "n_train": len(benign_flows),
-        "feature_dim": FEATURE_DIM,
-        "feature_contract_version": _FEATURE_CONTRACT_VERSION,
-    }
-    joblib.dump(bundle, save_path)
-    log.info("isoforest: saved %s (trained on %d flows)", save_path.name, len(benign_flows))
+    return (model, scaler, platt_b, df_scale)
 
-    # Hot-swap in memory as one atomic rebind — see _state.
-    _swap_state(model, scaler, platt_b, df_scale)
+
+def persist_state(state: tuple, n_train: int) -> Path:
+    """Persist an accepted model without changing the serving pointer."""
+    import joblib
+    model, scaler, platt_b, df_scale = state
+    save_path = _MODELS_DIR / f"{_MODEL_STEM}{_next_version()}.pkl"
+    joblib.dump({"model": model, "scaler": scaler, "platt_b": platt_b,
+                 "df_scale": df_scale, "n_train": n_train,
+                 "feature_dim": FEATURE_DIM,
+                 "feature_contract_version": _FEATURE_CONTRACT_VERSION}, save_path)
+    record_artifact_digests([save_path])
+    return save_path
+
+
+def train_isoforest(benign_flows: list[FlowRecord]) -> None:
+    """Explicit offline training entry point; fit, persist, then install."""
+    candidate = fit_candidate(benign_flows)
+    persist_state(candidate, len(benign_flows))
+    restore_state(candidate)
 
 
 def score_isoforest_batch(flows: list[FlowRecord]) -> list[LayerScore]:
@@ -429,10 +447,15 @@ def restore_state(state: tuple) -> None:
     _swap_state(*state)
 
 
-def score_values(flows: list[FlowRecord]) -> list[float]:
-    """Return raw anomaly scores for a batch, without building LayerScores.
-
-    drift/ compares score *distributions*, so it needs the numbers rather than
-    the per-flow detection records.
-    """
-    return [score_isoforest(f).raw_score for f in flows]
+def score_values(flows: list[FlowRecord], state=None) -> list[float]:
+    """Score against an explicit candidate or a stable serving snapshot."""
+    import numpy as np
+    if not flows:
+        return []
+    state = state if state is not None else snapshot_state()
+    if state is None:
+        raise RuntimeError("No Isolation Forest model available")
+    model, scaler, _, df_scale = state
+    features = np.array([extract_features(f) for f in flows], dtype=float)
+    scores = model.decision_function(scaler.transform(features))
+    return np.clip((-scores / df_scale + 1.0) / 2.0, 0.0, 1.0).tolist()

@@ -115,6 +115,9 @@ class FlowRecord(BaseModel):
         description="SYN packets / total packets [0, 1]; 0 for non-TCP flows.",
     )
 
+    target_pkt_rate: Optional[float] = Field(None, ge=0, allow_inf_nan=False, description="Destination/service packet rate in this window; rule context, not model input")
+    target_syn_fraction: Optional[float] = Field(None, ge=0, le=1, allow_inf_nan=False)
+
     # Source-IP entropy — high entropy indicates spoofed/distributed DDoS.
     src_ip_entropy: float = Field(
         0.0, ge=0, allow_inf_nan=False,
@@ -144,7 +147,11 @@ class FlowRecord(BaseModel):
 
 
 class LayerScore(BaseModel):
-    """Detection layer output: raw and calibrated scores."""
+    """Detection layer output. Historical probability fields may be heuristic.
+
+    Only explicitly fitted final fusion calibration supports a calibrated
+    confidence claim; see evidence and /ready confidence_mode.
+    """
 
     flow_id: str = Field(..., description="Unique flow identifier")
     layer_name: str = Field(..., description="Detection layer name (rules, stats, isoforest, xgb)")

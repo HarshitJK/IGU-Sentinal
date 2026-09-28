@@ -12,7 +12,7 @@ Built for SIH26145 (NTRO, Blockchain & Cybersecurity theme).
 - Alert schema is fixed: `{timestamp, flow_id, threat_class, confidence_score, evidence}` — field names must match exactly, do not rename.
 
 ## Stack
-Python + FastAPI (backend/orchestration) + React (dashboard — deferred, not in scope yet).
+Python + FastAPI (backend/orchestration) + React (implemented dashboard).
 Single in-process FastAPI service. No HTTP calls between internal modules — plain function/async calls only.
 tshark is the only external process (packet capture); everything downstream of it is in-process Python.
 
@@ -57,10 +57,12 @@ igu_sentinel/
 ## Threat classes (six, PS-mandated — every detector must map to at least one)
 volumetric_ddos, c2_beaconing, dga_dns_tunneling, encrypted_malware, recon_scanning, data_exfiltration
 
-## Detection pipeline decisions (locked)
+## Detection pipeline decisions
+
+Current implementation and evidence in README.md and VERIFICATION_STATUS.md supersede historical design aspirations below. Default confidence is heuristic; optional held-out fusion calibration estimates proposed-class correctness. Automatic retraining is disabled.
 - Window: fixed 120ms capture window. Do NOT make this adaptive — an adaptive window is gameable by an attacker who manipulates traffic rate to force a weak window size. Fixed and simple is the correct, defensible choice.
 - Capture: tshark as a subprocess (`-T json` or `-T fields`), piped into Python — do not hand-roll packet parsing.
-- Isolation Forest: trained once on a benign-only warmup batch (baseline). Never retrain on unvalidated traffic — only retrain on flows confirmed benign by the FUSED cross-layer verdict, not by isoforest's own low score alone (prevents poisoning).
+- Isolation Forest: trained once on a benign-only warmup batch (baseline). Never retrain on unvalidated traffic — manual retraining requires explicitly trusted benign inputs and a fixed reference sample. Model agreement is not ground truth or proof against poisoning.
 - Drift detection: monitor rolling-window mean/variance of isoforest anomaly scores; compare current vs. original baseline distribution using KS test or PSI (PSI > 0.2 = literature-standard "significant drift" threshold). Bound how much a single retrain can shift the decision boundary. Never discard the original baseline model — keep it as a permanent fallback/reference.
 - XGBoost: multi-class classifier (one class per threat type + benign), trained on labeled synthetic traffic from traffic_gen. Use class weighting — benign traffic will vastly outnumber attacks. Report per-class precision/recall/F1, never aggregate accuracy alone (misleading on imbalanced data).
 - Confidence fusion: each layer's raw score calibrated to a probability via Platt scaling (fit on held-out labeled data) BEFORE fusion. Cross-layer correlation: require agreement across >=2 independent layers to reach high-confidence tier; single-layer-only detections downgrade to advisory. Output field stays named `confidence_score` (PS wording) but is a calibrated probability under the hood.
@@ -77,7 +79,7 @@ Vary source-IP mode (`hping3 --rand-source` or a fixed spoof pool), rate (`-i`),
 
 ## Benchmarking / evaluation
 - Primary: train and evaluate on traffic_gen output (PS-mandated synthetic traffic).
-- Secondary (generalization check, not primary training): cross-validate against CIC-IDS2017/2018, UNSW-NB15, CTU-13 (botnet/C2 focus) after stripping any bidirectional-only fields to respect the diode constraint.
+- Secondary (generalization check, not primary training): cross-validate against CIC-IDS2017/2018, UNSW-NB15, CTU-13 (botnet/C2 focus) using only passively observed measurements. One-way transport can carry observations of both conversation directions; unseen reverse bytes remain unknown.
 - Report per-class precision/recall/F1 on both. Do not optimize toward a single target accuracy number — that invites overfitting to the synthetic generator.
 - A dedicated benchmark harness module must measure and log sustained flows/sec and end-to-end latency (capture window + processing) — this is a graded PS requirement, not optional polish.
 
@@ -87,8 +89,8 @@ Vary source-IP mode (`hping3 --rand-source` or a fixed spoof pool), rate (`-i`),
 - Test fixtures: `tests/fixtures/{threat_class}_sample.jsonl`.
 
 ## Deferred (not in scope for current build phase)
-- React dashboard / UX — parked, do not build yet.
-- Docker/diode containerization — build LAST, after skeleton + backend/ML are working and tested in-process.
+- React dashboard is implemented; maintain it alongside the static fallback.
+- Docker/diode simulation is implemented and verified separately from unit tests.
 
 ## Working agreement for this agent loop
 - Read this file fully before touching TASKS.md.
@@ -131,7 +133,9 @@ them and no listed module provided one. Confirm or relocate:
    failed at network creation everywhere else and took the whole stack with it.
    Split into an opt-in overlay.
 
-### Unresolved design questions
+### Historical audit questions
+
+Items 6–9 now have implementation paths: explicit heuristic labeling or held-out fusion calibration, packet-generated candidate splits, and pinned serving artifacts. Candidate coverage remains incomplete. Model manifests are digests, not signatures, and do not protect against a writer who can replace both artifacts and manifest.
 
 4. **Cross-layer corroboration is effectively two layers, not four.** Fusion
    grants the high-confidence tier when >=2 layers name the *same* threat class,
@@ -189,3 +193,11 @@ them and no listed module provided one. Confirm or relocate:
     code. Path containment and bundle-shape validation are now enforced, but
     anyone who can write to `models/` still achieves code execution in the
     service. A signed-manifest or hash-allowlist scheme would close this.
+
+### Authorized completion additions (2026-09-28)
+
+`eval/candidate.py`, `eval/dataset_adapters.py`, `fusion/calibration.py`,
+`benchmark/streaming.py`, and capture-building/public-extraction scripts support
+the user-authorized training, verification and dataset work. These extend the
+existing modules without adding services. Candidate artifacts remain isolated
+from default serving. See VERIFICATION_STATUS.md for measured limits.

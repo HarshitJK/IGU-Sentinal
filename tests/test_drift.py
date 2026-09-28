@@ -54,7 +54,7 @@ def test_drift_monitor_detects_drift():
     drifted_scores = [0.7 + (i % 10) * 0.02 for i in range(30)]
 
     # Monitor baseline
-    monitor_drift(baseline_scores)
+    set_baseline_distribution(baseline_scores)
 
     # Monitor drifted distribution
     is_drifted = monitor_drift(drifted_scores)
@@ -71,7 +71,7 @@ def test_drift_trigger_retrain():
     baseline_scores = [0.2 + (i % 10) * 0.02 for i in range(30)]
     drifted_scores = [0.7 + (i % 10) * 0.02 for i in range(30)]
 
-    monitor_drift(baseline_scores)
+    set_baseline_distribution(baseline_scores)
     is_drifted = monitor_drift(drifted_scores)
 
     if is_drifted:
@@ -92,7 +92,7 @@ def test_drift_bounded_retrain_preserves_baseline():
     baseline_scores = [0.2 + (i % 10) * 0.02 for i in range(30)]
     drifted_scores = [0.7 + (i % 10) * 0.02 for i in range(30)]
 
-    monitor_drift(baseline_scores)
+    set_baseline_distribution(baseline_scores)
     is_drifted = monitor_drift(drifted_scores)
 
     if is_drifted:
@@ -180,7 +180,7 @@ def test_psi_is_measured_against_the_original_baseline():
     reset_retrain_log()
 
     original = [0.10 + (i % 20) * 0.005 for i in range(200)]   # ~0.10-0.20
-    monitor_drift(original)                                     # establishes baseline
+    set_baseline_distribution(original)
 
     # Walk the distribution up in small steps. Each step is small relative to
     # the previous one, but the cumulative move from the original is large.
@@ -258,7 +258,8 @@ def test_bounded_retrain_refuses_excessive_boundary_shift():
     from igu_sentinel.detect import isoforest
 
     # A baseline distribution of tightly-clustered benign scores.
-    set_baseline_distribution([0.05 + (i % 10) * 0.002 for i in range(200)])
+    from igu_sentinel.drift import initialize_trusted_baseline
+    initialize_trusted_baseline(_load("benign"))
 
     before = isoforest.snapshot_state()
 
@@ -270,7 +271,7 @@ def test_bounded_retrain_refuses_excessive_boundary_shift():
         poison.extend(poison)
     submit_confirmed_benign(poison[:MIN_RETRAIN_SAMPLES + 10])
 
-    accepted = trigger_bounded_retrain()
+    accepted = trigger_bounded_retrain(poison[:MIN_RETRAIN_SAMPLES + 10])
 
     log_text = "\n".join(get_retrain_log())
     if not accepted:
@@ -289,7 +290,8 @@ def test_rollback_restores_original_baseline_model():
     reset_retrain_log()
     from igu_sentinel.detect import isoforest
 
-    set_baseline_distribution([0.05 + (i % 10) * 0.002 for i in range(200)])
+    from igu_sentinel.drift import initialize_trusted_baseline
+    initialize_trusted_baseline(_load("benign"))
     original = isoforest.snapshot_state()
 
     pool = _load("benign") * 20
@@ -327,3 +329,24 @@ def test_retrain_pool_has_a_hard_capacity():
     flow = _load("benign")[0]
     submit_confirmed_benign([flow] * (MAX_RETRAIN_SAMPLES + 100))
     assert get_retrain_pool_size() == MAX_RETRAIN_SAMPLES
+
+
+def test_observed_traffic_cannot_initialize_trusted_baseline():
+    monitor_drift([0.8, 0.9] * 100)
+    assert get_baseline_distribution() is None
+
+
+def test_candidate_fit_never_installs_or_persists(monkeypatch, tmp_path):
+    from igu_sentinel.detect import isoforest
+    before = isoforest.snapshot_state()
+    monkeypatch.setattr(isoforest, '_MODELS_DIR', tmp_path)
+    files_before = set(tmp_path.rglob('*'))
+    candidate = isoforest.fit_candidate(_load('benign'))
+    assert isoforest.snapshot_state() is before
+    assert set(tmp_path.rglob('*')) == files_before
+    assert len(isoforest.score_values(_load('benign'), state=candidate)) > 0
+
+
+def test_retrain_requires_fixed_reference_even_with_score_baseline():
+    set_baseline_distribution([.1, .2] * 50)
+    assert trigger_bounded_retrain(_load('benign') * 30) is False

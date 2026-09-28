@@ -91,3 +91,11 @@ def test_isoforest_returns_valid_score():
     assert 0 <= score.raw_score <= 1
     assert 0 <= score.calibrated_probability <= 1
     print("✓ test_isoforest_returns_valid_score passed")
+
+
+def test_missing_manifest_refuses_model(tmp_path, monkeypatch):
+    from igu_sentinel.detect import isoforest
+    path = tmp_path / 'model.pkl'
+    path.write_bytes(b'not a pickle')
+    monkeypatch.setattr(isoforest, '_MODELS_DIR', tmp_path)
+    assert not isoforest.verify_artifact(path)

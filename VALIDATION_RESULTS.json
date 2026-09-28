@@ -1,0 +1,287 @@
+{
+  "date": "2026-09-28",
+  "backend_tests": {
+    "passed": 257,
+    "skipped": 12,
+    "docker_tests_excluded": true
+  },
+  "frontend_build": "passed",
+  "docker_diode_verification": "forward delivery, reverse DROP, and live flow scoring passed",
+  "candidate": {
+    "scope": "Held-out capture groups; synthetic results do not establish real-world accuracy",
+    "feature_contract_version": 2,
+    "counts": {
+      "train": {
+        "benign": 126,
+        "volumetric_ddos": 1506,
+        "recon_scanning": 300,
+        "c2_beaconing": 40,
+        "dga_dns_tunneling": 50,
+        "data_exfiltration": 12
+      },
+      "calibration": {
+        "benign": 126,
+        "volumetric_ddos": 1506,
+        "recon_scanning": 300,
+        "c2_beaconing": 40,
+        "dga_dns_tunneling": 50,
+        "data_exfiltration": 12
+      },
+      "test": {
+        "benign": 127,
+        "volumetric_ddos": 1506,
+        "recon_scanning": 300,
+        "c2_beaconing": 40,
+        "dga_dns_tunneling": 50,
+        "data_exfiltration": 12
+      }
+    },
+    "partition_sha256": {
+      "train": "ba9d1780bab39dabe26965c76b90218d86f32e0d1c1b594e4532884c56649909",
+      "calibration": "2a7a319f8dc00d1fa23bf1835bd50a415f5076c74a4b067146675bb00a9a611a",
+      "test": "4ac5ba427dc569d1bd5ec7003c93f4af623523d25f057047eb1b64669a427019"
+    },
+    "class_order": [
+      "benign",
+      "volumetric_ddos",
+      "c2_beaconing",
+      "dga_dns_tunneling",
+      "encrypted_malware",
+      "recon_scanning",
+      "data_exfiltration"
+    ],
+    "classification_report": {
+      "benign": {
+        "precision": 0.9473684210526315,
+        "recall": 0.9921259842519685,
+        "f1-score": 0.9692307692307692,
+        "support": 127.0
+      },
+      "volumetric_ddos": {
+        "precision": 0.9993364299933643,
+        "recall": 1.0,
+        "f1-score": 0.9996681048788583,
+        "support": 1506.0
+      },
+      "c2_beaconing": {
+        "precision": 0.8695652173913043,
+        "recall": 1.0,
+        "f1-score": 0.9302325581395349,
+        "support": 40.0
+      },
+      "dga_dns_tunneling": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 50.0
+      },
+      "encrypted_malware": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1-score": 0.0,
+        "support": 0.0
+      },
+      "recon_scanning": {
+        "precision": 1.0,
+        "recall": 0.9566666666666667,
+        "f1-score": 0.9778534923339012,
+        "support": 300.0
+      },
+      "data_exfiltration": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 12.0
+      },
+      "accuracy": 0.9931203931203931,
+      "macro avg": {
+        "precision": 0.8308957240624714,
+        "recall": 0.8498275215598051,
+        "f1-score": 0.8395692749404376,
+        "support": 2035.0
+      },
+      "weighted avg": {
+        "precision": 0.9936604725991857,
+        "recall": 0.9931203931203931,
+        "f1-score": 0.9931979477472335,
+        "support": 2035.0
+      }
+    },
+    "confusion_matrix": [
+      [
+        126,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1506,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        40,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        50,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        7,
+        0,
+        6,
+        0,
+        0,
+        287,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        12
+      ]
+    ],
+    "benign_false_positive_rate": 0.007874015748031496,
+    "brier_class_correctness": 0.005294177964314226,
+    "unvalidated_classes": [
+      "encrypted_malware"
+    ],
+    "promoted": false
+  },
+  "streaming_benchmark": {
+    "scope": "Loopback exported-flow streaming benchmark through UDP ingest and disk append.\n\nIncludes sender scheduling, socket buffering, validation, inference and alert\nappend. Excludes packet capture/extraction, fsync and browser rendering. No\nnetwork probes: generated FlowRecord datagrams go only to 127.0.0.1.\n",
+    "python": "3.12.14",
+    "machine": "x86_64",
+    "cpu_count": 16,
+    "target_flows_per_second": 200,
+    "target_duration_seconds": 10.0,
+    "sender_elapsed_seconds": 9.995116929000119,
+    "actual_send_rate": 200.09770913206054,
+    "sent": 2000,
+    "unscored": 0,
+    "capture": {
+      "status": "stopped",
+      "interface": "udp:42889",
+      "window_ms": 120,
+      "windows_processed": 64,
+      "alerts_emitted": 2000,
+      "alerts_suppressed": 0,
+      "flows_scored": 2000,
+      "error": null,
+      "started_at": "2026-09-28T12:32:55.008242",
+      "running": false
+    },
+    "sender_errors": [],
+    "latency_samples": 2000,
+    "send_to_append_ms": {
+      "p50": 118.99477099996147,
+      "p95": 199.31050499985759,
+      "p99": 219.11600800001452,
+      "max": 252.54262599992217
+    }
+  },
+  "public_capture": {
+    "dataset": "CTU-13 scenario 7 (CTU-Malware-Capture-Botnet-48)",
+    "source": "https://mcfp.felk.cvut.cz/publicDatasets/CTU-Malware-Capture-Botnet-48/",
+    "citation": "Garcia, Sebastian. Malware Capture Facility Project. https://stratosphereips.org; Garcia et al., An empirical comparison of botnet detection methods, Computers & Security 45 (2014), 100\u2013123.",
+    "sha256": {
+      "botnet-capture-20110816-sogou.pcap": "ff5c18adaa6a4681df1db43d0eac10d05e65d51931d5380ca54ceff0d005d2c5",
+      "capture20110816-2.binetflow": "df0b5338190b967bd340a0d6c1bb3c34d1bbfb4b7ffa764c2dd26f77f1a26680"
+    },
+    "bytes": {
+      "botnet-capture-20110816-sogou.pcap": 18868213,
+      "capture20110816-2.binetflow": 15630512
+    },
+    "feature_contract_version": 2,
+    "extracted_flows": 3366,
+    "extraction_seconds": 19.036640609000074,
+    "ingest_counters": {},
+    "original_label_counts": {
+      "flow=Background-Established-cmpgw-CVUT": 10468,
+      "flow=Background": 2999,
+      "flow=Background-UDP-Established": 32659,
+      "flow=From-Normal-V48-Stribrek": 807,
+      "flow=To-Background-UDP-CVUT-DNS-Server": 45799,
+      "flow=From-Background-CVUT-Proxy": 71,
+      "flow=Background-UDP-Attempt": 4088,
+      "flow=To-Background-CVUT-Proxy": 1706,
+      "flow=Background-TCP-Established": 11821,
+      "flow=Background-UDP-NTP-Established-1": 308,
+      "flow=Background-Attempt-cmpgw-CVUT": 955,
+      "flow=Background-google-webmail": 44,
+      "flow=Background-TCP-Attempt": 565,
+      "flow=Background-google-analytics11": 36,
+      "flow=From-Normal-V48-Grill": 520,
+      "flow=Background-google-analytics16": 53,
+      "flow=Background-google-analytics1": 33,
+      "flow=Background-google-analytics12": 41,
+      "flow=Background-google-analytics7": 17,
+      "flow=Background-google-analytics9": 28,
+      "flow=To-Background-Jist": 7,
+      "flow=To-Background-CVUT-WebServer": 231,
+      "flow=Background-google-analytics13": 33,
+      "flow=Background-google-analytics6": 40,
+      "flow=To-Background-Stribrek": 3,
+      "flow=Background-google-analytics4": 27,
+      "flow=Background-google-analytics14": 51,
+      "flow=Background-google-analytics10": 26,
+      "flow=Background-google-analytics5": 40,
+      "flow=To-Background-MatLab-Server": 47,
+      "flow=To-Normal-V48-UDP-NTP-server": 8,
+      "flow=From-Normal-V48-Jist": 292,
+      "flow=Background-google-pop": 15,
+      "flow=Background-google-analytics15": 29,
+      "flow=Background-google-analytics3": 26,
+      "flow=To-Background-Grill": 3,
+      "flow=Background-google-analytics8": 26,
+      "flow=Background-google-analytics2": 30,
+      "flow=From-Normal-V48-CVUT-WebServer": 49,
+      "flow=From-Botnet-V48-UDP-DNS": 21,
+      "flow=From-Botnet-V48-TCP-HTTP-Google-Net-Established-6": 1,
+      "flow=From-Botnet-V48-UDP-Attempt": 1,
+      "flow=Background-ajax.google": 9,
+      "flow=From-Botnet-V48-TCP-CC77-HTTP-Not-Encrypted": 7,
+      "flow=From-Botnet-V48-TCP-WEB-Established": 8,
+      "flow=From-Botnet-V48-TCP-Attempt": 3,
+      "flow=From-Botnet-V48-TCP-CC108-Plain-HTTP": 19,
+      "flow=From-Botnet-V48-TCP-HTTP-Google-Net-Established-7": 1,
+      "flow=From-Botnet-V48-TCP-Established-HTTP-Binary-Download-12": 1,
+      "flow=From-Normal-V48-UDP-CVUT-DNS-Server": 1,
+      "flow=From-Botnet-V48-TCP-Established-HTTP-Ad-4": 1,
+      "flow=Background-www.fel.cvut.cz": 3
+    },
+    "label_join_status": "Not joined: full-network flow labels and botnet-only PCAP cover different populations; timestamps/timezone and interval joins need validation",
+    "training_eligible": false
+  }
+}

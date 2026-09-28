@@ -24,10 +24,12 @@ SUSPICIOUS_PORTS = {
 # (measured 1-6 per 120ms window); scanners touch tens to thousands.
 SCAN_FANOUT_THRESHOLD = 15
 
-# A flood is distinguished from ordinary fast traffic by actually moving volume:
-# either the frames are mostly payload, or they are large.
-FLOOD_BYTE_RATIO_MIN = 0.85
-FLOOD_PACKET_SIZE_MIN = 700
+# A flood is distinguished from ordinary fast traffic by actually moving volume.
+# Size is only corroborating evidence; SYN and packet rates cover small floods.
+# byte_ratio (payload/frame) must NOT be used here — a 1200-byte UDP payload
+# with a 28-byte header gives byte_ratio ≈ 0.977, indistinguishable from what
+# the exfil heuristic used to look for, causing the flood-vs-exfil confusion.
+FLOOD_PACKET_SIZE_MIN = 700  # bytes; frames this large are doing real work
 
 # ── C2 beacon timing ─────────────────────────────────────────────────────────
 # Callback intervals real C2 frameworks use: Cobalt Strike defaults to 60s,
@@ -93,6 +95,18 @@ def detect_rules(flow: FlowRecord) -> LayerScore:
     def vote(threat_class: str, weight: float) -> None:
         candidates[threat_class] = candidates.get(threat_class, 0.0) + weight
 
+    target_rate = flow.target_pkt_rate if flow.target_pkt_rate is not None else flow.pkt_rate
+    target_syn = flow.target_syn_fraction if flow.target_syn_fraction is not None else flow.syn_fraction
+    if target_rate >= 500 and target_syn >= 0.8:
+        score += 0.55
+        evidence.append(f"syn_flood_rate={flow.pkt_rate:.1f}/s")
+        vote("volumetric_ddos", 0.55)
+
+    if target_rate >= 5000 and flow.src_ip_entropy >= 1:
+        score += 0.55
+        evidence.append(f"distributed_target_rate={target_rate:.1f}/s, source_entropy={flow.src_ip_entropy:.2f}")
+        vote("volumetric_ddos", 0.55)
+
     # Check for volumetric DDoS: extremely low inter-arrival times AND traffic
     # concentrated on a single target. Without the fan-out qualifier this rule
     # also fired on port scans (equally fast, but spread across many targets).
@@ -101,12 +115,12 @@ def detect_rules(flow: FlowRecord) -> LayerScore:
         evidence.append("extremely_low_inter_arrival_time")
         # Rate alone is NOT a flood: on loopback and fast LAN links, ordinary
         # background traffic is routinely sub-millisecond. A volumetric attack
-        # is fast AND concentrated on one target AND actually pushing volume.
+        # is fast AND concentrated on one target AND actually pushing large frames.
+        # byte_ratio is NOT used here — it is payload/frame, not outbound volume,
+        # and a large UDP flood payload yields byte_ratio ≈ 1.0, which would
+        # collide with the exfiltration heuristic below.
         concentrated = (not flow.fanout_count) or flow.fanout_count < SCAN_FANOUT_THRESHOLD
-        high_volume = (
-            flow.byte_ratio >= FLOOD_BYTE_RATIO_MIN
-            or flow.packet_size_stats["mean"] >= FLOOD_PACKET_SIZE_MIN
-        )
+        high_volume = flow.packet_size_stats["mean"] >= FLOOD_PACKET_SIZE_MIN
         if concentrated and high_volume:
             score += 0.25
             evidence.append("sustained_high_volume_on_single_target")
@@ -163,8 +177,11 @@ def detect_rules(flow: FlowRecord) -> LayerScore:
         score += 0.45
         evidence.append(f"high_target_fanout={flow.fanout_count}")
         vote("recon_scanning", 0.45)
-        # Probes are tiny and carry essentially no payload - corroborating signal.
-        if flow.packet_size_stats["mean"] < 200 and flow.byte_ratio < 0.35:
+        # Probes are tiny — small packet size is a corroborating signal.
+        # byte_ratio is NOT checked here: a probe with 0-byte payload has
+        # byte_ratio=0, which is correct, but this check would also suppress
+        # valid small-payload probes using application protocols.
+        if flow.packet_size_stats["mean"] < 200:
             score += 0.15
             evidence.append("low_volume_probe_traffic")
             vote("recon_scanning", 0.15)
@@ -202,12 +219,25 @@ def detect_rules(flow: FlowRecord) -> LayerScore:
         score += 0.10
         evidence.append("very_high_entropy_payload")
 
-    # Check for data exfiltration: large packets over sustained connection
-    if flow.byte_ratio > 0.95 and flow.packet_size_stats["mean"] > 900:
-        score += 0.25
-        evidence.append("large_sustained_byte_transfer")
-        vote("data_exfiltration", 0.25)
-
+    # Data exfiltration: directional outbound volume (v2) or fallback heuristic.
+    #
+    # Exfiltration is defined by WHERE data goes, not by payload/frame ratio.
+    # byte_ratio (payload/frame) is deliberately NOT used here because:
+    #   1. A UDP flood with 1200-byte payload over a 1228-byte frame gives
+    #      byte_ratio ≈ 0.977 — identical to a large upload, so this rule was
+    #      classifying every high-rate large-packet UDP flood as exfiltration.
+    #   2. Encrypted exfil (TLS) shows byte_ratio ≈ 0 because tshark cannot
+    #      extract the encrypted payload bytes — the rule missed it entirely.
+    #   3. Exfiltration is slow and sustained, not the same thing as "large packet".
+    if flow.outbound_bytes is not None and flow.inbound_bytes is not None:
+        # v2: we have measured directional volumes. Exfil shows large outbound
+        # with negligible inbound (the command channel is tiny).
+        ratio_out = (flow.outbound_bytes /
+                     max(flow.outbound_bytes + flow.inbound_bytes, 1))
+        if ratio_out > 0.9 and flow.outbound_bytes > 10_000:
+            score += 0.30
+            evidence.append(f"directional_exfil_outbound={flow.outbound_bytes}B")
+            vote("data_exfiltration", 0.30)
     # Strongest-evidence verdict wins; ties break on the class name so the
     # result is deterministic rather than dependent on dict insertion order.
     threat_guess = None

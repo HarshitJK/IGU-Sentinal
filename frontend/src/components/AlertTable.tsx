@@ -6,7 +6,7 @@
  */
 import { useState } from 'react';
 import type { AlertRecord } from '../hooks/useAlertStream';
-import { THREAT_CLASS_LABELS, THREAT_CLASS_COLOR_VAR, confidenceTier } from '../api/types';
+import { THREAT_CLASS_LABELS, THREAT_CLASS_COLOR_VAR, confidenceTier, severityFor } from '../api/types';
 import { AlertDrawer } from './AlertDrawer';
 
 interface AlertTableProps {
@@ -63,7 +63,7 @@ export function AlertTable({ alerts }: AlertTableProps) {
             }}>
               <thead>
                 <tr style={{ background: 'var(--bg-base)' }}>
-                  {['Time', 'Flow', 'Threat', 'Confidence'].map(col => (
+                  {['Time', 'Flow', 'Threat', 'Severity', 'Confidence'].map(col => (
                     <th key={col} style={{
                       padding: '8px 16px',
                       textAlign: 'left',
@@ -120,6 +120,9 @@ export function AlertTable({ alerts }: AlertTableProps) {
                       fontWeight: 500,
                     }}>
                       {THREAT_CLASS_LABELS[alert.threat_class]}
+                    </td>
+                    <td style={{ padding: '9px 16px' }}>
+                      <span className={`badge badge-${severityFor(alert.threat_class)}`}>{severityFor(alert.threat_class)}</span>
                     </td>
                     <td style={{ padding: '9px 16px' }}>
                       <ConfidenceBadge score={alert.confidence_score} />

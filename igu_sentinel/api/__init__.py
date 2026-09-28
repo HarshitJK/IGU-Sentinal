@@ -49,6 +49,12 @@ from igu_sentinel.ingest import (
 log = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app):
+    baseline_path = os.environ.get("IGU_TRUSTED_BASELINE_PATH")
+    if baseline_path:
+        from igu_sentinel.drift import initialize_trusted_baseline
+        with open(baseline_path) as source:
+            reference = [FlowRecord.model_validate_json(line) for line in source if line.strip()]
+        initialize_trusted_baseline(reference)
     if os.environ.get("IGU_UDP_PORT"):
         capture.start(f"udp:{int(os.environ['IGU_UDP_PORT'])}", DEFAULT_WINDOW_MS, asyncio.get_running_loop())
     yield
@@ -103,6 +109,13 @@ MAX_FLOWS_PER_REQUEST = int(os.environ.get("IGU_MAX_FLOWS_PER_REQUEST", "10000")
 # A slow or wedged WebSocket client must not stall the broadcast to everyone
 # else, nor the capture thread feeding it.
 _WS_SEND_TIMEOUT_S = 2.0
+
+# Maximum alerts queued per client before we declare it overloaded and drop it.
+# At the default 120ms window the ingest path produces at most ~8 alerts/s under
+# a realistic attack load; 50 slots gives a 6-second grace period before drop.
+_WS_MAX_PENDING = max(1, int(os.environ.get("IGU_WS_MAX_PENDING", "50")))
+_MAX_BROADCAST_PENDING = 64
+_WS_MAX_CLIENTS = 100
 
 # The alert stream is server-push; clients have nothing to say. Anything larger
 # than a keepalive is refused rather than buffered.
@@ -224,19 +237,53 @@ def _websocket_authorized(websocket: WebSocket) -> bool:
 
 # ── WebSocket connection manager ──────────────────────────────────────────────
 class ConnectionManager:
-    """Manages active WebSocket connections for streaming real-time alerts."""
+    """Manages active WebSocket connections for streaming real-time alerts.
+
+    Counters exposed via get_ws_counters() and /metrics/ws:
+      broadcasts_total   – total broadcast_alert() calls
+      deliveries_total   – individual (client, message) sends that succeeded
+      drops_total        – clients dropped due to send timeout or queue full
+      errors_total       – send exceptions that did not result in a drop
+    """
 
     def __init__(self):
         self.active_connections: Set[WebSocket] = set()
+        # Counters — plain ints; only mutated from the async event loop so no
+        # lock is needed for the FastAPI/asyncio single-threaded path.
+        self._broadcasts_total: int = 0
+        self._deliveries_total: int = 0
+        self._drops_total: int = 0
+        self._errors_total: int = 0
+        # Per-client pending count: tracks inflight sends to avoid filling the
+        # send buffer of a slow client without knowing it.
+        self._send_locks: dict = {}
+        self._pending: dict = {}   # WebSocket -> int
 
     async def connect(self, websocket: WebSocket):
+        if len(self.active_connections) >= _WS_MAX_CLIENTS:
+            await websocket.close(code=1013)
+            return
         await websocket.accept()
         self.active_connections.add(websocket)
+        self._pending[websocket] = 0
+        self._send_locks[websocket] = asyncio.Lock()
         log.info("WebSocket client connected. Active: %d", len(self.active_connections))
 
     def disconnect(self, websocket: WebSocket):
         self.active_connections.discard(websocket)
+        self._pending.pop(websocket, None)
+        self._send_locks.pop(websocket, None)
         log.info("WebSocket client disconnected. Active: %d", len(self.active_connections))
+
+    def get_counters(self) -> dict:
+        """Return a snapshot of current broadcast counters."""
+        return {
+            "broadcasts_total":  self._broadcasts_total,
+            "deliveries_total":  self._deliveries_total,
+            "drops_total":       self._drops_total,
+            "errors_total":      self._errors_total,
+            "active_clients":    len(self.active_connections),
+        }
 
     async def broadcast_alert(self, alert: Alert):
         """Broadcast an Alert as JSON to all active WebSocket connections.
@@ -244,11 +291,12 @@ class ConnectionManager:
         Sends run concurrently with a per-connection timeout. Sending serially
         without a timeout let one wedged client stall the broadcast for every
         other client — and, on the live-capture path, stall the capture thread
-        that was waiting on this coroutine. A client that times out is treated
-        as dead and dropped.
+        that was waiting on this coroutine. A client that times out or whose
+        pending queue exceeds _WS_MAX_PENDING is treated as dead and dropped.
         """
         if not self.active_connections:
             return
+        self._broadcasts_total += 1
 
         payload = {
             "timestamp": alert.timestamp.isoformat(),
@@ -261,10 +309,33 @@ class ConnectionManager:
         connections = list(self.active_connections)
 
         async def _send(conn: WebSocket) -> bool:
+            # Drop clients whose pending queue is already full — a slow receiver
+            # should not accumulate a backlog of hundreds of unread alerts.
+            if self._pending.get(conn, 0) >= _WS_MAX_PENDING:
+                log.warning("ws: client overloaded (pending=%d), dropping",
+                             self._pending.get(conn, 0))
+                self._drops_total += 1
+                return False
+            self._pending[conn] = self._pending.get(conn, 0) + 1
             try:
-                await asyncio.wait_for(conn.send_json(payload), timeout=_WS_SEND_TIMEOUT_S)
+                async def serial_send():
+                    async with self._send_locks.setdefault(conn, asyncio.Lock()):
+                        if conn not in self.active_connections:
+                            raise ConnectionError("Client disconnected")
+                        await conn.send_json(payload)
+                await asyncio.wait_for(serial_send(), timeout=_WS_SEND_TIMEOUT_S)
+                self._pending[conn] = max(0, self._pending.get(conn, 1) - 1)
+                self._deliveries_total += 1
                 return True
-            except Exception:
+            except asyncio.TimeoutError:
+                self._drops_total += 1
+                self._pending.pop(conn, None)
+                log.warning("ws: client send timed out, dropping")
+                return False
+            except Exception as exc:
+                self._errors_total += 1
+                self._pending.pop(conn, None)
+                log.warning("ws: send error: %s", exc)
                 return False
 
         results = await asyncio.gather(
@@ -273,6 +344,10 @@ class ConnectionManager:
         for conn, ok in zip(connections, results):
             if ok is not True:
                 self.disconnect(conn)
+                try:
+                    await asyncio.wait_for(conn.close(code=1013), timeout=_WS_SEND_TIMEOUT_S)
+                except Exception:
+                    pass
 
 
 manager = ConnectionManager()
@@ -361,6 +436,7 @@ class CaptureController:
         self._thread: Optional[threading.Thread] = None
         self._stop_event: Optional[threading.Event] = None
         self._lock = threading.Lock()
+        self._broadcast_slots = threading.BoundedSemaphore(_MAX_BROADCAST_PENDING)
         self.state: dict = {
             "status": "idle",          # idle | starting | running | stopped | error
             "interface": None,
@@ -439,18 +515,22 @@ class CaptureController:
                         continue
                     log_alert(alert)
                     self.state["alerts_emitted"] += 1
-                    # Broadcast on the main event loop where the WS clients live.
-                    # Fire-and-forget: blocking the capture thread on each
-                    # broadcast made dashboard latency backpressure the capture
-                    # itself, so a slow client dropped packets. Delivery errors
-                    # are reported by the callback; the broadcast has its own
-                    # per-connection timeout.
+                    # Reserve before scheduling: an overloaded event loop cannot
+                    # accumulate unbounded run_coroutine_threadsafe callbacks.
+                    if not self._broadcast_slots.acquire(blocking=False):
+                        self.state["broadcasts_dropped"] = self.state.get("broadcasts_dropped", 0) + 1
+                        continue
+                    coro = manager.broadcast_alert(alert)
                     try:
-                        fut = asyncio.run_coroutine_threadsafe(
-                            manager.broadcast_alert(alert), loop
-                        )
-                        fut.add_done_callback(_log_broadcast_failure)
+                        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+                        def completed(future):
+                            self._broadcast_slots.release()
+                            _log_broadcast_failure(future)
+                        fut.add_done_callback(completed)
                     except Exception:
+                        coro.close()
+                        self._broadcast_slots.release()
+                        self.state["broadcast_errors"] = self.state.get("broadcast_errors", 0) + 1
                         log.exception("live capture: could not schedule alert broadcast")
         except LiveCaptureError as exc:
             self.state["status"] = "error"
@@ -513,7 +593,7 @@ def _train_stats_baseline_once() -> None:
     global _stats_trained
 
     fixtures_dir = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
-    benign_file = fixtures_dir / "benign_sample.jsonl"
+    benign_file = Path(os.environ.get("IGU_STATS_BASELINE_PATH", str(fixtures_dir / "benign_sample.jsonl")))
     benign_flows: list[FlowRecord] = []
     if benign_file.exists():
         with open(benign_file) as fh:
@@ -654,9 +734,17 @@ async def readiness():
     ingest_ready = capture.state.get("status") != "error"
     if os.environ.get("IGU_UDP_PORT"):
         ingest_ready = ingest_ready and capture.is_running()
-    ready = models_ready and ingest_ready
+    calibration_ready = True
+    if os.environ.get("IGU_CONFIDENCE_CALIBRATION"):
+        from igu_sentinel.fusion.calibration import configured
+        try:
+            configured(os.environ["IGU_CONFIDENCE_CALIBRATION"])
+        except Exception:
+            calibration_ready = False
+    ready = models_ready and ingest_ready and calibration_ready
     return JSONResponse({"status": "ready" if ready else "not_ready", "models_ready": models_ready,
-                         "ingest_ready": ingest_ready}, status_code=200 if ready else 503)
+                         "ingest_ready": ingest_ready, "calibration_ready": calibration_ready,
+                         "confidence_mode": "calibrated" if os.environ.get("IGU_CONFIDENCE_CALIBRATION") else "heuristic"}, status_code=200 if ready else 503)
 
 
 @app.websocket("/ws/alerts")
@@ -834,3 +922,10 @@ async def dashboard():
     dashboard_file = Path(__file__).parent / "dashboard.html"
     html = dashboard_file.read_text(encoding="utf-8")
     return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/metrics/ws", dependencies=[Depends(require_token)])
+def websocket_metrics():
+    return {**manager.get_counters(),
+            "capture_broadcasts_dropped": capture.state.get("broadcasts_dropped", 0),
+            "capture_broadcast_errors": capture.state.get("broadcast_errors", 0)}

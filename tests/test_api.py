@@ -336,3 +336,46 @@ def test_browser_session_requires_login_and_rejects_cross_origin(monkeypatch):
             pass
         assert client.post("/auth/logout", headers={"Origin": "https://testserver"}).status_code == 200
         assert client.get("/capture/status").status_code == 401
+
+
+def test_capture_broadcast_backlog_is_bounded(monkeypatch):
+    import asyncio
+    from concurrent.futures import Future
+    from datetime import datetime
+    import threading
+    from igu_sentinel import api
+    from igu_sentinel.schemas import Alert
+    count = api._MAX_BROADCAST_PENDING + 5
+    alerts = [Alert(timestamp=datetime.now(), flow_id=f'bounded-{i}',
+                    threat_class='volumetric_ddos', confidence_score=.9, evidence=[]) for i in range(count)]
+    monkeypatch.setattr(api, '_ensure_stats_baseline', lambda: None)
+    monkeypatch.setattr(api, 'extract_flows_from_udp', lambda **kw: iter([[object()] * count]))
+    monkeypatch.setattr(api, 'run_detection_pipeline_scored', lambda flows: [([], a) for a in alerts])
+    monkeypatch.setattr(api, 'is_actionable_alert', lambda *args: True)
+    persisted, pending = [], []
+    monkeypatch.setattr(api, 'log_alert', persisted.append)
+    def stalled_loop(coro, loop):
+        coro.close()
+        future = Future()
+        pending.append(future)
+        return future
+    monkeypatch.setattr(asyncio, 'run_coroutine_threadsafe', stalled_loop)
+    controller = api.CaptureController()
+    controller._worker('udp:9000', 120, object(), threading.Event())
+    assert len(persisted) == count
+    assert len(pending) == api._MAX_BROADCAST_PENDING
+    assert controller.state['broadcasts_dropped'] == 5
+    for future in pending:
+        future.set_result(None)
+    assert controller._broadcast_slots.acquire(blocking=False)
+
+
+def test_ws_metrics_require_auth(monkeypatch):
+    from fastapi.testclient import TestClient
+    from igu_sentinel.api import app
+    monkeypatch.setenv('IGU_API_TOKEN', 'metrics-secret')
+    with TestClient(app) as client:
+        assert client.get('/metrics/ws').status_code == 401
+        response = client.get('/metrics/ws', headers={'Authorization': 'Bearer metrics-secret'})
+        assert response.status_code == 200
+        assert 'drops_total' in response.json()

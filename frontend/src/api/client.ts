@@ -78,3 +78,10 @@ export function login(token: string): Promise<{ authenticated: boolean }> {
 export function logout(): Promise<{ authenticated: boolean }> {
   return request('/auth/logout', { method: 'POST' });
 }
+
+export async function fetchReadiness(): Promise<boolean> {
+  const response = await fetch(BASE_URL + '/ready', { credentials: 'include' });
+  if (response.status !== 200 && response.status !== 503) throw new Error('Readiness unavailable');
+  const status = await response.json() as { status: string };
+  return status.status === 'ready';
+}

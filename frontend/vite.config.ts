@@ -9,6 +9,7 @@ export default defineConfig({
     proxy: {
       // REST API
       '/auth': { target: 'http://localhost:8000', changeOrigin: false },
+      '/ready': { target: 'http://localhost:8000', changeOrigin: false },
       '/health': { target: 'http://localhost:8000', changeOrigin: true },
       '/capture': { target: 'http://localhost:8000', changeOrigin: false },
       '/detect':  { target: 'http://localhost:8000', changeOrigin: false },

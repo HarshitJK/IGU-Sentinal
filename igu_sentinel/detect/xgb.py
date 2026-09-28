@@ -15,6 +15,7 @@ Model lifecycle:
   - train_xgb() saves a new versioned JSON file and hot-swaps in memory.
 """
 
+import os
 import logging
 import threading
 from pathlib import Path
@@ -24,7 +25,7 @@ from igu_sentinel.schemas import FlowRecord, LayerScore
 from igu_sentinel.detect.features import extract_features, FEATURE_DIM, _FEATURE_CONTRACT_VERSION
 # Shared with isoforest so there is one definition of how an artifact is
 # pinned and how its digest is checked.
-from igu_sentinel.detect.isoforest import _pinned_model_name, verify_artifact
+from igu_sentinel.detect.isoforest import _pinned_model_name, verify_artifact, record_artifact_digests
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ THREAT_CLASSES: List[str] = [
 VALID_THREAT_CLASSES = set(THREAT_CLASSES) - {"benign"}
 
 # ── model storage ────────────────────────────────────────────────────────────
-_MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
+_MODELS_DIR = Path(os.environ.get("IGU_MODELS_DIR", Path(__file__).resolve().parents[2] / "models"))
 _MODEL_STEM = "xgb_v"
 
 # ── in-memory state ──────────────────────────────────────────────────────────
@@ -96,7 +97,8 @@ def _latest_model_path() -> Optional[Path]:
         candidate = _MODELS_DIR / pinned
         if candidate.exists() and candidate.resolve().parent == _MODELS_DIR.resolve():
             return candidate
-        log.error("models/CURRENT pins %r which is missing — falling back", pinned)
+        log.error("models/CURRENT pins %r which is missing — refusing fallback", pinned)
+        return None
     existing = _model_files()
     return existing[-1] if existing else None
 
@@ -159,7 +161,7 @@ def _load_model_from_disk() -> bool:
             label_encoder = {i: c for i, c in enumerate(THREAT_CLASSES)}
 
         unknown = {c for c in label_encoder.values() if c not in THREAT_CLASSES}
-        if unknown:
+        if unknown or sorted(label_encoder) != list(range(len(label_encoder))) or len(set(label_encoder.values())) != len(label_encoder) or len(label_encoder) != model.n_classes_:
             log.error(
                 "xgb: %s maps to unknown classes %s — refusing to load",
                 label_path.name, sorted(unknown),
@@ -213,6 +215,8 @@ def train_xgb(flows: list[FlowRecord], labels: list[str]) -> None:
         raise ValueError("flows and labels must have equal length.")
     if not flows:
         raise ValueError("Must provide at least one flow.")
+    if not set(labels) <= set(THREAT_CLASSES) or "benign" not in labels or len(set(labels)) < 2:
+        raise ValueError("Training requires benign plus at least one supported threat class")
 
     try:
         import xgboost as xgb
@@ -277,6 +281,7 @@ def train_xgb(flows: list[FlowRecord], labels: list[str]) -> None:
     label_data["_feature_contract_version"] = _FEATURE_CONTRACT_VERSION
     with open(label_path, "w") as fh:
         _json.dump(label_data, fh)
+    record_artifact_digests([model_path, label_path])
 
     log.info("xgb: saved %s (classes=%s, n=%d)", model_path.name, ordered, len(flows))
 

@@ -316,7 +316,7 @@
                                 <th>Timestamp</th>
                                 <th>Flow ID</th>
                                 <th>Threat Class</th>
-                                <th>Confidence</th>
+                                <th>Severity</th><th>Confidence</th>
                             </tr>
                         </thead>
                         <tbody id="alertsTable">
@@ -519,6 +519,7 @@
                             <td>${time}</td>
                             <td style="font-family: monospace; font-size: 10px;">${escapeHtml(alert.flow_id.slice(-8))}</td>
                             <td class="${getThreatClass(threatClass)}">${threatClass}</td>
+                            <td>${["recon_scanning", "dga_dns_tunneling"].includes(threatClass) ? "medium" : "high"}</td>
                             <td class="${getConfidenceClass(alert.confidence_score)}">${confidence}%</td>
                         </tr>
                     `;

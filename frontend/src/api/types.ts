@@ -78,10 +78,14 @@ export const THREAT_CLASS_COLOR_VAR: Record<ThreatClass, string> = {
   data_exfiltration: 'var(--tc-data_exfiltration)',
 };
 
-/** Derive a confidence tier for badge styling */
-export function confidenceTier(score: number): 'critical' | 'high' | 'medium' | 'low' {
-  if (score >= 0.85) return 'critical';
-  if (score >= 0.65) return 'high';
-  if (score >= 0.40) return 'medium';
+/** Analyst triage policy based on potential impact, independent of confidence.
+ * No class is automatically critical; asset/business context is unavailable. */
+export function severityFor(threat: ThreatClass): 'high' | 'medium' {
+  return threat === 'recon_scanning' || threat === 'dga_dns_tunneling' ? 'medium' : 'high';
+}
+
+export function confidenceTier(score: number): 'high' | 'medium' | 'low' {
+  if (score >= 0.8) return 'high';
+  if (score >= 0.5) return 'medium';
   return 'low';
 }

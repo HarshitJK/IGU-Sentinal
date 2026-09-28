@@ -1,108 +1,91 @@
 # SIH26145 verification status — 2026-09-28
 
-The repository is a working prototype, not a validated production detector.
-This report supersedes readiness and performance claims in older documents.
+Working prototype; real-world detection accuracy is not established. This report
+supersedes historical claims in PROJECT_STATUS.md. Machine-readable evidence is
+in [VALIDATION_RESULTS.json](VALIDATION_RESULTS.json).
 
-## Feature migration update
+## Completed
 
-The partially implemented v2 contract has been corrected and staged. Default
-serving remains v1 (16 features) with the pinned models. Set
-`IGU_FEATURE_CONTRACT_VERSION=2` before starting a training/evaluation process
-to select the 27-feature candidate contract. Existing v1 artifacts are rejected
-in that mode; do not enable it in the demo until compatible models are trained,
-evaluated and explicitly pinned. No replacement serving artifacts were created.
+- Bounded streaming ingest and incremental PCAP replay; malformed/truncated JSON,
+  reader failures and subprocess stderr are handled explicitly.
+- Corrected v2 contract: 27 model features, fixed-window rates, SYN statistics,
+  target source entropy, DNS length/type and observed directional volumes.
+  Missing reverse traffic stays unknown; byte_ratio remains payload/frame size.
+- Model loaders reject missing digests, incompatible contracts/dimensions,
+  invalid pins and malformed label maps. SHA-256 manifests are not signatures.
+- Isolated candidate training with capture-group/source-hash partition checks,
+  training-only statistics baseline, held-out fusion calibration and test metrics.
+  Calibration checks model, baseline and pipeline fingerprints.
+- Trusted drift reference initialization and isolated candidate fitting before
+  replacement. Manual retraining requires explicitly trusted data and a fixed
+  reference; automatic retraining is disabled. PSI does not prove poisoning safety.
+- Bounded dashboard broadcasts and per-client sends, authenticated WebSocket
+  metrics, and readiness checks for models, ingest and calibration.
+- Dashboard separates policy severity from confidence and displays degraded
+  readiness. Default confidence is explicitly heuristic.
+- External CSV adapters retain partial measurements/provenance rather than invent
+  required features or map arbitrary malware labels to exfiltration.
+- Updated runbook and public dataset acquisition/extraction documentation.
 
-New measurements include fixed-window packet/byte rates, SYN counts, source
-entropy across packets targeting the same destination/service, and paired
-directional volumes within each window. Configure `IGU_PROTECTED_CIDRS` to
-identify inside/outside traffic. An unobserved reverse direction stays null.
-DNS query length now reaches the model vector; TXT is a categorical indicator,
-not a measured fraction. SYN and DNS extraction handle nested tshark fields.
+Existing cookie authentication, alert-chain verification, one-way Docker feed
+and explicit opt-in attack lab configuration remain covered. Disk appends are
+not fsync-backed; software isolation is not a physical data diode.
 
-Regression tests cover those measurements, v2 rejection of legacy models, and
-isolated v2 training/reload. Fixture training in these tests proves software
-compatibility only. Missing feature values in legacy fixtures are not measured
-training data. The flood/exfiltration classification failure remains unresolved
-until a representative v2 dataset and models are validated. A 1ms DDoS fixture
-interval is not inherently wrong; DDoS rates vary, and matching one lab example
-is not a valid reason to relabel or reshape all training data.
+## Final checks
 
-## Verified fixes
-
-- The dashboard no longer embeds the API secret. Operators sign in using an
-  HttpOnly session cookie; cross-origin cookie requests and sockets are checked.
-- Sentinel has no production-network interface. The simulated diode receives
-  production UDP records and forwards them to the enclave. Forwarding counters,
-  blocked reverse traffic, and actual scored flows are checked by
-  `scripts/verify-diode.py`. This software simulation is not a hardware diode.
-- Python 3.12 dependencies are pinned in `requirements.lock`; the XGBoost CPU
-  package matches the saved model. Frontend builds after removal of accidentally
-  tracked `frontend/src/node_modules`, which shadowed installed dependencies.
-- PCAP replay now parses incrementally through the same capture-time windows
-  as live ingest. Capture state is scoped per stream, beacon history survives
-  ephemeral source-port changes, and TLS fields retain duplicate JSON keys.
-- Capture queues and packet windows have bounds. The retraining candidate pool
-  is capped at 5,000 and requires conservative agreement across all detectors.
-  Automatic retraining is disabled; candidate labels are not ground truth.
-- Configured alert-log write failures propagate instead of being ignored.
-  Unverifiable persisted chains prevent startup. Appends are not fsync-backed.
-- Aggregate traffic generation defaults to mock records. Lab commands require
-  an explicit single configuration and `--allow-lab`.
-
-## Checks completed
-
-- Backend: **231 passed, 12 skipped** with `SKIP_DOCKER_TESTS=1`. Docker checks
-  are separate; skipped tests must not be counted as verified.
+- Backend: **257 passed, 12 skipped**, with SKIP_DOCKER_TESTS=1; one dependency
+  deprecation warning. Docker checks below ran separately.
 - React production build: passed.
-- Docker diode proof: forward ACCEPT and reverse DROP counters increased;
-  one-way ingestion produced scored flows and persisted alerts.
+- Docker rebuild and diode proof: passed forward delivery, reverse DROP and live
+  scoring; 522 flows scored and 470 alerts emitted at the verification snapshot.
+- Isolated v2 model/calibration fingerprint startup check: passed.
+- Exported-flow benchmark: **200 flows/sec for 10 seconds**, 2,000 sent/scored,
+  no observed loss. Send-to-log-append p95 **199.31ms**, p99 **219.12ms**.
+  Includes UDP buffering, validation, inference and disk append; excludes packet
+  extraction, fsync and browser rendering. Host: x86_64, 16 logical CPUs,
+  Python 3.12.14. This is neither a long soak nor raw-packet throughput proof.
 
-## Independent packet lab
+## Candidate results and serving status
 
-Run `.venv/bin/python scripts/validate-packet-lab.py`. It writes deterministic
-Ethernet/IP PCAPs and `data/packet-lab/report.json`, then runs tshark extraction
-and the existing inference pipeline. It sends no packets on any network and
-does not reuse the model-training FlowRecord generator.
+The isolated candidate is in data/candidate-v2-final/. Train/calibration/test
+captures have different seeds and hashes but share synthetic scenario families.
+These functional results do not establish independent real-world accuracy.
 
-| Scenario | Input packets | Extracted flows | Result |
-|---|---:|---:|---|
-| Irregular benign UDP | 80 | 80 | All suppressed |
-| TCP port scan | 150 | 150 | 141 scan alerts, 9 suppressed |
-| 30-second UDP callbacks | 20 | 20 | 17 beacon alerts, 3 warm-up flows suppressed |
-| UDP flood | 2,000 | 3 | All incorrectly labelled data exfiltration |
+| Test class | Test flows | Correct after alert gating |
+|---|---:|---:|
+| Benign | 127 | 126 |
+| Volumetric DDoS | 1,506 | 1,506 |
+| C2 beaconing | 40 | 40 |
+| DNS tunnelling/DGA | 50 | 50 |
+| Reconnaissance | 300 | 287 |
+| Exfiltration | 12 | 12 |
+| Encrypted malware | 0 | Unvalidated |
 
-These are tiny, constructed functional checks, not representative accuracy
-estimates. DNS tunnelling, encrypted malware, and directional exfiltration have
-not been validated by this lab. Replay wall time is not live detection latency.
+One benign false alert (0.79%); six scans labelled beaconing and seven suppressed.
+Full precision/recall/F1, confusion matrix and hashes are in the JSON report.
+Flood/exfiltration confusion is resolved on these candidate scenarios. The
+original v1 packet-lab failure is not claimed fixed in default serving.
 
-## Remaining work, in priority order
+**Candidate not promoted.** Default serving retains v1, 16-feature pinned models
+isoforest_v18.pkl and xgb_v15.json. Enabling v2 without compatible artifacts
+fails readiness. See README for the candidate workflow.
 
-1. Version the feature contract and rebuild training data. `byte_ratio` currently
-   measures payload/frame size, not outbound/inbound byte volume. Add observed
-   directional volumes with explicit visibility/missing-value semantics,
-   SYN and source-entropy rate features, and DNS query-length/type features.
-   Do not reinterpret the existing 16-feature model without retraining it.
-2. Evaluate all six classes on held-out packet captures and legitimate traffic;
-   fix the UDP-flood/exfiltration confusion above. Fit probability calibration
-   on held-out data and publish per-class metrics and false-positive rates.
-3. Establish drift baselines from trusted benign data. The current monitor can
-   initialize from the first observed batch. Manual bounded retraining still
-   installs candidates before evaluation and needs an isolated candidate path
-   and a fixed reference sample before it can be enabled automatically.
-4. Bound outstanding WebSocket broadcasts, then measure sustained input rate,
-   drops and capture-to-alert latency including extraction and persistence.
-   `make benchmark` measures in-process scoring only.
-5. Separate severity from confidence in the dashboard. Complete operational
-   documentation and artifact lifecycle checks. The artifact manifest contains
-   SHA-256 digests, not cryptographic signatures; absent-manifest enforcement
-   remains permissive.
+## Public data and remaining work
 
-## Reproduce
+Downloaded official CTU-13 scenario 7 PCAP and flow labels; extracted **3,366**
+measured flows. [PUBLIC_DATA.md](PUBLIC_DATA.md) records URLs, citation, sizes,
+hashes and commands. Full-network labels and the infected-host PCAP require
+validated temporal joins and threat-specific interpretation before training.
+Generic botnet labels do not prove periodic C2 or encrypted malware.
 
-Use Python 3.12 (`make venv`, or install `requirements.lock` in an existing
-environment). Install tshark for PCAP replay. Run `make test-unit` and
-`cd frontend && npm ci && npm run build`. Run `docker compose up -d --build`
-and `python3 scripts/verify-diode.py` for the isolated demo. The API is published
-only on `127.0.0.1:8000`; `/ready` checks model and configured ingest availability.
-Set `IGU_API_TOKEN` before starting Compose to require operator sign-in.
-`docker compose down` preserves the alert-history volume.
+Remaining acceptance work:
+
+1. Representative independently labelled packet captures for all six classes,
+   especially encrypted malware and legitimate encrypted traffic.
+2. Validated public label joins, evaluation on unseen capture families,
+   representative calibration and false-positive review before v2 promotion.
+3. Raw-packet extraction-to-alert measurements and longer-duration tests on the
+   intended deployment hardware; browser delivery latency is also unmeasured.
+
+The first two depend on suitable data and label quality. The third is additional
+performance validation; the exported-flow target above is demonstrated.

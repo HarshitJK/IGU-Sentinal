@@ -61,33 +61,12 @@ _COLUMN_ALIASES = {
 # Explicit label mapping from CIC-IDS2017 ground truth labels to the 7 classes.
 # Ambiguous or non-applicable attacks are intentionally left unmapped (or mapped to None).
 _LABEL_MAPPING = {
-    "benign": "benign",
-    # DDoS / DoS variants
-    "ddos": "volumetric_ddos",
-    "dos hulk": "volumetric_ddos",
-    "dos goldeneye": "volumetric_ddos",
-    "dos slowloris": "volumetric_ddos",
-    "dos slowhttptest": "volumetric_ddos",
-    # PortScan / Probing
+    "benign": "benign", "ddos": "volumetric_ddos",
+    "dos hulk": "volumetric_ddos", "dos goldeneye": "volumetric_ddos",
+    "dos slowloris": "volumetric_ddos", "dos slowhttptest": "volumetric_ddos",
     "portscan": "recon_scanning",
-    # Botnet / C2
-    "bot": "c2_beaconing",
-    # Web attacks / Exfil / Infiltration
-    "ftp-patator": "data_exfiltration",
-    "ssh-patator": "data_exfiltration",
-    "web attack – brute force": "data_exfiltration",
-    "web attack – xss": "data_exfiltration",
-    "web attack – sql injection": "data_exfiltration",
-    "infiltration": "encrypted_malware",
-    "heartbleed": "encrypted_malware",
 }
-
-# Labels in CIC-IDS2017 that do NOT have a clean 1:1 mapping to our 7 classes.
-# Documented explicitly rather than forcing inaccurate classifications:
-UNMAPPED_LABELS_DOCUMENTATION = [
-    "Web Attack – Sql Injection (sometimes classified as recon or exfil depending on payload size)",
-    "Infiltration (cross-boundary pivoting; maps partially to encrypted_malware)",
-]
+UNMAPPED_LABELS_DOCUMENTATION = ["Bot, infiltration, web attacks and credential attacks have no exact class mapping"]
 
 
 def _normalise(col: str) -> str:
@@ -109,111 +88,18 @@ def map_cicids_label(raw_label: Optional[str]) -> Optional[str]:
     if cleaned in _LABEL_MAPPING:
         return _LABEL_MAPPING[cleaned]
 
-    # Partial / substring fallback for encoding discrepancies (e.g. en-dash)
-    for k, v in _LABEL_MAPPING.items():
-        if k in cleaned:
-            return v
     return None
 
 
 def convert_row_to_flow_record(
     row: Dict[str, str], col_map: Dict[str, str], index: int
 ) -> Optional[Tuple[FlowRecord, str]]:
-    """Convert a single CSV row from CIC-IDS2017 into a FlowRecord.
-
-    Only forward-direction fields are used; all Bwd_* columns are dropped.
-    """
-    if not row or not isinstance(row, dict):
-        return None
-    raw_label = row.get(col_map.get("label", "")) or "benign"
-    mapped_label = map_cicids_label(raw_label)
-    if mapped_label is None:
-        return None
-
-    def _get_float(canonical_key: str, default: float = 0.0) -> float:
-        actual_col = col_map.get(canonical_key)
-        if not actual_col or actual_col not in row:
-            return default
-        try:
-            val = float(row[actual_col])
-            return val if np.isfinite(val) else default
-        except (ValueError, TypeError):
-            return default
-
-    def _get_int(canonical_key: str, default: int = 0) -> int:
-        return int(_get_float(canonical_key, float(default)))
-
-    dst_port = _get_int("dst_port", 80)
-    proto_raw = _get_int("protocol", 6)
-    proto_str = "TCP" if proto_raw == 6 else "UDP" if proto_raw == 17 else "ICMP" if proto_raw == 1 else "OTHER"
-
-    fwd_len_mean = _get_float("fwd_pkt_len_mean", 0.0)
-    fwd_len_std = _get_float("fwd_pkt_len_std", 0.0)
-    fwd_len_min = _get_float("fwd_pkt_len_min", 0.0)
-    fwd_len_max = _get_float("fwd_pkt_len_max", fwd_len_mean)
-
-    # DIODE NOTE: we use forward-direction IAT exclusively (Fwd IAT Mean/Std),
-    # never the bidirectional Flow IAT columns.  Fallback to flow-level only if
-    # the dedicated Fwd IAT columns are absent from this CSV variant.
-    fwd_iat_mean_us = _get_float("fwd_iat_mean", -1.0)
-    if fwd_iat_mean_us < 0:  # column absent — use bidirectional fallback
-        fwd_iat_mean_us = _get_float("flow_iat_mean", 0.0)
-        fwd_iat_std_us = _get_float("flow_iat_std", 0.0)
-    else:
-        fwd_iat_std_us = _get_float("fwd_iat_std", 0.0)
-    # CICFlowMeter stores IATs in microseconds; convert to seconds.
-    fwd_iat_mean_s = fwd_iat_mean_us / 1e6
-    fwd_iat_std_s = fwd_iat_std_us / 1e6
-
-    # byte_ratio: payload bytes / (payload + header bytes)
-    # This is the only ratio a diode sensor can measure from forward frames.
-    # Hard-coding 1.0 made every flow look like data_exfiltration (model feature 7).
-    fwd_payload = _get_float("fwd_bytes", 0.0)
-    fwd_hdr = _get_float("fwd_hdr_len", 0.0)
-    total_observed = fwd_payload + fwd_hdr
-    byte_ratio = min(1.0, fwd_payload / total_observed) if total_observed > 0 else 0.5
-
-    # Proxy entropy from packet length variance.
-    # CIC-IDS does not expose Shannon entropy directly.  Variance of packet sizes
-    # correlates with randomness: encrypted/compressed payloads produce large, similar
-    # packets (low variance, high entropy), while scans produce tiny uniform probes.
-    # We map variance → [0, 8] range: variance of ~60,000 bytes² → entropy ≈ 8.
-    pkt_variance = _get_float("pkt_len_variance", -1.0)
-    if pkt_variance >= 0:
-        # sqrt(variance) = std; map 0..1000 bytes → 0..8 bits
-        proxy_entropy = min(8.0, (pkt_variance ** 0.5) / 125.0)
-    else:
-        # Fallback: use fwd_pkt_len_std
-        proxy_entropy = min(8.0, fwd_len_std / 125.0)
-
-    record = FlowRecord(
-        flow_id=f"cicids_{index:07d}",
-        timestamp=datetime.now(),
-        src_port=0,
-        dst_port=dst_port,
-        protocol=proto_str,
-        packet_size_stats={
-            "min": fwd_len_min,
-            "max": fwd_len_max,
-            "mean": fwd_len_mean,
-            "std": fwd_len_std,
-        },
-        inter_arrival_stats={
-            "min": 0.0,
-            "max": fwd_iat_mean_s * 2.0,
-            "mean": fwd_iat_mean_s,
-            "std": fwd_iat_std_s,
-        },
-        entropy=proxy_entropy,
-        byte_ratio=byte_ratio,
-        ttl=_get_int("ttl", 64),
-        ja4=None,
-        beacon_interval_stats=None,
-        dns_ngram_entropy=None,
-        fanout_count=1,
+    """Deprecated: source CSV lacks required packet-level measurements."""
+    raise ValueError(
+        "CSV-only CICIDS rows cannot supply entropy, payload fraction or 120ms "
+        "features. Use eval.dataset_adapters for partial observations and "
+        "re-extract the PCAP for inference; proxy features are not supported."
     )
-
-    return record, mapped_label
 
 
 def load_cicids_dataset(

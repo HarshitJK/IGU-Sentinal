@@ -234,4 +234,5 @@ def fuse_layers(scores: list[LayerScore]) -> Alert:
         evidence=all_evidence if all_evidence else ["fused_from_multiple_layers"],
     )
 
-    return alert
+    from .calibration import apply_configured
+    return apply_configured(scores, alert)

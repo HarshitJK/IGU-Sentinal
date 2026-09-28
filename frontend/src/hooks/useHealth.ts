@@ -3,17 +3,16 @@
  * Returns the health state and whether the backend is reachable.
  */
 import { useState, useEffect, useCallback } from 'react';
-import { fetchHealth } from '../api/client';
+import { fetchReadiness } from '../api/client';
 
-export type ApiState = 'online' | 'offline' | 'checking';
+export type ApiState = 'online' | 'degraded' | 'offline' | 'checking';
 
 export function useHealth(intervalMs = 10_000) {
   const [state, setState] = useState<ApiState>('checking');
 
   const check = useCallback(async () => {
     try {
-      await fetchHealth();
-      setState('online');
+      setState(await fetchReadiness() ? 'online' : 'degraded');
     } catch {
       setState('offline');
     }

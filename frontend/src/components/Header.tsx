@@ -16,6 +16,7 @@ interface HeaderProps {
 
 function apiStateLabel(state: ApiState): string {
   switch (state) {
+    case 'degraded': return 'DETECTION NOT READY';
     case 'online':   return 'API ONLINE';
     case 'offline':  return 'API OFFLINE';
     case 'checking': return 'API CHECKING';
@@ -82,7 +83,7 @@ export function Header({ apiState, streamState, captureStatus }: HeaderProps) {
         alignItems: 'center',
         gap: 20,
       }}>
-        <StatusIndicator dot={<StatusDot state={apiState} />} label={apiStateLabel(apiState)} />
+        <StatusIndicator dot={<StatusDot state={apiState === 'degraded' ? 'error' : apiState} />} label={apiStateLabel(apiState)} />
         <StatusIndicator dot={<StatusDot state={streamState} />} label={streamStateLabel(streamState)} />
         <StatusIndicator dot={<StatusDot state={captureStatus ?? 'idle'} />} label={captureStateLabel(captureStatus)} />
       </div>

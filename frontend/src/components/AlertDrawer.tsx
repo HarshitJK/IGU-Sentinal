@@ -4,7 +4,7 @@
  */
 import { X } from 'lucide-react';
 import type { AlertRecord } from '../hooks/useAlertStream';
-import { THREAT_CLASS_LABELS, THREAT_CLASS_COLOR_VAR, confidenceTier } from '../api/types';
+import { THREAT_CLASS_LABELS, THREAT_CLASS_COLOR_VAR, confidenceTier, severityFor } from '../api/types';
 
 interface AlertDrawerProps {
   alert: AlertRecord;
@@ -82,8 +82,7 @@ export function AlertDrawer({ alert, onClose }: AlertDrawerProps) {
                 fontSize: 24,
                 fontWeight: 600,
                 fontFamily: 'var(--font-mono)',
-                color: tier === 'critical' ? 'var(--threat-critical)'
-                  : tier === 'high' ? 'var(--threat-high)'
+                color: tier === 'high' ? 'var(--threat-high)'
                   : tier === 'medium' ? 'var(--threat-medium)'
                   : 'var(--threat-low)',
               }}>
@@ -95,6 +94,11 @@ export function AlertDrawer({ alert, onClose }: AlertDrawerProps) {
             </div>
           </div>
 
+          <div>
+            <div className="drawer-field-label">Severity (triage policy)</div>
+            <span className={`badge badge-${severityFor(alert.threat_class)}`}>{severityFor(alert.threat_class)}</span>
+            <p>Based on threat class; actual business impact requires analyst review.</p>
+          </div>
           {/* Flow ID */}
           <div>
             <div className="drawer-field-label">Flow ID</div>

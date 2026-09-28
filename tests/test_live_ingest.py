@@ -113,8 +113,10 @@ class _FakeStderr:
     def __init__(self, text):
         self._text = text
 
-    def read(self):
-        return self._text
+    def read(self, size=-1):
+        chunk = self._text if size < 0 else self._text[:size]
+        self._text = "" if size < 0 else self._text[size:]
+        return chunk
 
 
 @pytest.fixture(autouse=True)
@@ -299,3 +301,19 @@ def test_capture_start_reports_error_without_crashing(monkeypatch):
 
     # Service still responds normally afterwards.
     assert client.get("/health").status_code == 200
+
+
+def test_packet_json_object_size_is_bounded():
+    with pytest.raises(LiveCaptureError, match='exceeds'):
+        list(_iter_json_objects(['{"payload":"' + 'x' * 200 + '"}'], max_object_chars=128))
+
+
+def test_truncated_packet_json_is_reported():
+    with pytest.raises(LiveCaptureError, match='truncated'):
+        list(_iter_json_objects(['[{"payload":"unfinished']))
+
+
+def test_reader_parse_failure_is_not_a_successful_capture():
+    fake = _FakeProc(stdout_lines=['[{"payload":"unfinished'], alive=True)
+    with pytest.raises(LiveCaptureError, match='truncated'):
+        list(extract_flows_from_interface('test', _popen=lambda *a, **k: fake))

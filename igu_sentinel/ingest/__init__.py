@@ -501,7 +501,7 @@ def extract_flows_from_pcap(pcap_path: str) -> List[FlowRecord]:
     return [flow for window in iter_flows_from_pcap(pcap_path) for flow in window]
 
 
-def iter_flows_from_pcap(pcap_path: str) -> Iterator[List[FlowRecord]]:
+def iter_flows_from_pcap(pcap_path: str, counters=None) -> Iterator[List[FlowRecord]]:
     """Stream packet JSON from tshark; never load the whole capture into memory."""
     with tempfile.TemporaryFile(mode="w+") as errors:
         try:
@@ -510,7 +510,7 @@ def iter_flows_from_pcap(pcap_path: str) -> Iterator[List[FlowRecord]]:
         except FileNotFoundError as exc:
             raise RuntimeError("tshark not found in PATH") from exc
         try:
-            yield from flow_windows_from_packets(_iter_json_objects(proc.stdout))
+            yield from flow_windows_from_packets(_iter_json_objects(proc.stdout), counters=counters)
             if proc.wait(timeout=10) != 0:
                 errors.seek(0)
                 raise RuntimeError(f"tshark failed: {errors.read(4096)}")
@@ -568,8 +568,8 @@ class PacketWindow:
         return _build_flow_records(packets, _ja4_from_packets(packets), state=self.state, window_ms=self.window_ms)
 
 
-def flow_windows_from_packets(packets, window_ms=DEFAULT_WINDOW_MS):
-    window = PacketWindow(window_ms)
+def flow_windows_from_packets(packets, window_ms=DEFAULT_WINDOW_MS, counters=None):
+    window = PacketWindow(window_ms, counters=counters)
     for packet in packets:
         ready = window.push(packet)
         if ready is not None:
@@ -647,8 +647,10 @@ def _build_flow_records(
         targets_by_source[f_src_ip].add((f_dst_ip, f_dst_port))
 
     sources_by_target = defaultdict(list)
+    syns_by_target = defaultdict(int)
     for (source, _, destination, port, proto), observations in flows_data.items():
         sources_by_target[(destination, port, proto)].extend([source] * len(observations))
+        syns_by_target[(destination, port, proto)] += sum(p["is_syn"] for p in observations)
 
     # Create FlowRecord for each flow
     flow_records = []
@@ -824,6 +826,8 @@ def _build_flow_records(
             # counting let a scanner evade the threshold purely by pacing.
             fanout_count=max(fanout, len(targets_by_source.get(src_ip, ())) or 1),
             # ── v2 fields ─────────────────────────────────────────────────────
+            target_pkt_rate=len(sources_by_target[(dst_ip, dst_port, protocol)]) / span_s,
+            target_syn_fraction=syns_by_target[(dst_ip, dst_port, protocol)] / len(sources_by_target[(dst_ip, dst_port, protocol)]),
             pkt_rate=pkt_rate,
             byte_rate=byte_rate,
             syn_count=syn_count,
@@ -842,7 +846,7 @@ def _build_flow_records(
 
 # ── Live interface capture ────────────────────────────────────────────────────
 
-def _iter_json_objects(line_iter: Iterable[str]) -> Iterator[Dict[str, Any]]:
+def _iter_json_objects(line_iter: Iterable[str], max_object_chars=2_000_000) -> Iterator[Dict[str, Any]]:
     """Yield each complete top-level JSON object from tshark ``-T json`` output.
 
     tshark ``-T json`` emits a pretty-printed array; in live mode it streams the
@@ -858,6 +862,8 @@ def _iter_json_objects(line_iter: Iterable[str]) -> Iterator[Dict[str, Any]]:
         for ch in line:
             if depth > 0:
                 buf.append(ch)
+                if len(buf) > max_object_chars:
+                    raise LiveCaptureError("tshark packet JSON exceeds configured size limit")
             if in_str:
                 if esc:
                     esc = False
@@ -878,9 +884,12 @@ def _iter_json_objects(line_iter: Iterable[str]) -> Iterator[Dict[str, Any]]:
                     if depth == 0:
                         try:
                             yield json.loads("".join(buf))
-                        except json.JSONDecodeError:
-                            pass
+                        except json.JSONDecodeError as exc:
+                            raise LiveCaptureError("Malformed tshark packet JSON") from exc
                         buf = []
+
+    if depth:
+        raise LiveCaptureError("tshark packet JSON truncated at EOF")
 
 
 def _live_tshark_command(interface: str) -> List[str]:
@@ -1036,6 +1045,19 @@ def extract_flows_from_interface(
     counters = counters if counters is not None else {}
     pkt_q = queue.Queue(maxsize=8192)
     reader_done = threading.Event()
+    reader_errors = []
+    stderr_tail = deque(maxlen=8)
+
+    def drain_stderr():
+        if proc.stderr is not None:
+            while True:
+                chunk = proc.stderr.read(1024)
+                if not chunk:
+                    break
+                stderr_tail.append(chunk)
+
+    errors_thread = threading.Thread(target=drain_stderr, name="tshark-stderr", daemon=True)
+    errors_thread.start()
 
     def _reader():
         try:
@@ -1045,6 +1067,8 @@ def extract_flows_from_interface(
                         pkt_q.put_nowait(obj)
                     except queue.Full:
                         counters["packets_dropped"] = counters.get("packets_dropped", 0) + 1
+        except Exception as exc:
+            reader_errors.append(exc)
         finally:
             reader_done.set()
 
@@ -1063,6 +1087,10 @@ def extract_flows_from_interface(
             ready = window.push(item)
             if ready is not None:
                 yield ready
+        if reader_errors:
+            raise LiveCaptureError(str(reader_errors[0]))
+        if proc.poll() not in (None, 0):
+            raise LiveCaptureError("tshark exited: " + "".join(stderr_tail)[-4096:])
         if window.packets:
             yield window.flush()
     finally:
@@ -1076,5 +1104,12 @@ def extract_flows_from_interface(
         except Exception:
             try:
                 proc.kill()
+                proc.wait(timeout=2)
             except Exception:
                 pass
+        reader.join(timeout=2)
+        errors_thread.join(timeout=2)
+        for handle in (proc.stdout, proc.stderr):
+            close = getattr(handle, "close", None)
+            if close is not None:
+                close()

@@ -1,27 +1,11 @@
-"""Score drift detection and bounded retrain of the Isolation Forest.
+"""Drift monitoring with an explicit trusted reference and isolated candidates.
 
-What this module guarantees (CLAUDE.md, "Drift detection")
-----------------------------------------------------------
-1. Drift is measured against the **original** benign baseline distribution, not
-   against the previous window. Comparing each window to the last one lets an
-   attacker walk the baseline anywhere they like one small step at a time —
-   every individual step looks drift-free, so nothing ever fires. The original
-   distribution is captured once and never overwritten.
-2. A retrain is **bounded**: the candidate model's score distribution may not
-   move further than ``MAX_BOUNDARY_SHIFT_PSI`` from the original baseline. A
-   candidate that exceeds the bound is discarded and the previous model stays.
-3. The **original model is never discarded**. It is snapshotted before the first
-   retrain and can be restored at any time via :func:`rollback_to_baseline`.
-4. Retrain input must be **fused-verdict benign**. Isolation Forest's own low
-   score is not evidence of benignity — retraining on what the model already
-   likes is exactly the model-poisoning path the PS constraints call out.
-   :func:`submit_confirmed_benign` is the only way flows enter the retrain pool.
-
-Previously this module computed PSI with a mis-scaled smoothing term, compared
-each window against the previous one, and ``trigger_bounded_retrain()`` wrote a
-log line and returned — it never retrained, never bounded anything, and nothing
-in the pipeline ever called it.
+Live observations never establish the baseline. Model-selected benign records
+are bounded candidates, not verified training labels. Manual retraining requires
+explicit trusted inputs, compares against the original fixed reference, and
+installs only a passing candidate. PSI bounds do not prove attack resistance.
 """
+import os
 import logging
 import math
 import threading
@@ -46,7 +30,9 @@ MAX_RETRAIN_SAMPLES = 5000
 # Rolling window of recent isoforest scores kept for the drift comparison.
 ROLLING_WINDOW = 500
 
-_lock = threading.Lock()
+_lock = threading.RLock()
+_retrain_lock = threading.Lock()
+_reference_flows: List[FlowRecord] = []
 
 # The original benign score distribution. Written once, never overwritten.
 _baseline_distribution: Optional[List[float]] = None
@@ -187,7 +173,7 @@ def set_baseline_distribution(scores: Sequence[float]) -> None:
 def monitor_drift(scores: Sequence[float]) -> bool:
     """Compare a window of isoforest scores against the ORIGINAL baseline.
 
-    The first call establishes the baseline and reports no drift.
+    Without an explicitly supplied trusted baseline, monitoring is inactive.
 
     Args:
         scores: Recent isoforest raw anomaly scores.
@@ -202,7 +188,6 @@ def monitor_drift(scores: Sequence[float]) -> bool:
         first_call = _baseline_distribution is None
 
     if first_call:
-        set_baseline_distribution(scores)
         return False
 
     with _lock:
@@ -210,8 +195,10 @@ def monitor_drift(scores: Sequence[float]) -> bool:
         _recent_scores.extend(scores)
         del _recent_scores[:-ROLLING_WINDOW]
 
-    psi = compute_psi(baseline, scores)
-    ks = compute_ks(baseline, scores)
+        window = list(_recent_scores)
+
+    psi = compute_psi(baseline, window)
+    ks = compute_ks(baseline, window)
     drifted = psi > DRIFT_PSI_THRESHOLD
 
     if drifted:
@@ -257,97 +244,68 @@ def get_retrain_pool_size() -> int:
 
 # ── Bounded retrain ───────────────────────────────────────────────────────────
 
+def initialize_trusted_baseline(flows: Sequence[FlowRecord]) -> None:
+    """Explicit operator/offline reference, never populated from live verdicts."""
+    from igu_sentinel.detect import isoforest
+    global _baseline_distribution, _baseline_model_state
+    if not flows:
+        raise ValueError("Trusted reference cannot be empty")
+    reference = [f.model_copy(deep=True) for f in flows[:MAX_RETRAIN_SAMPLES]]
+    state = isoforest.snapshot_state()
+    scores = isoforest.score_values(reference, state=state)
+    with _lock:
+        if _reference_flows:
+            return
+        _reference_flows.extend(reference)
+        _baseline_distribution = scores
+        _baseline_model_state = state
+    _log_event(f"Trusted fixed reference initialized (n={len(reference)})")
+
+
 def trigger_bounded_retrain(flows: Optional[Sequence[FlowRecord]] = None) -> bool:
-    """Retrain the Isolation Forest under an explicit boundary-shift bound.
+    """Manually fit/evaluate a candidate before installing it. No auto retrain.
 
-    Steps:
-      1. Snapshot the original model on first use (permanent fallback).
-      2. Retrain on confirmed-benign flows only.
-      3. Score the original baseline sample through the candidate model and
-         measure how far its score distribution moved (PSI).
-      4. If the move exceeds MAX_BOUNDARY_SHIFT_PSI, restore the previous model
-         and refuse the retrain.
-
-    Args:
-        flows: Confirmed-benign flows to train on. Defaults to the pool built by
-            :func:`submit_confirmed_benign`.
-
-    Returns:
-        True if a new model was accepted, False if refused or not attempted.
+    Callers supplying flows attest their provenance; the automatically collected
+    pool is only a set of candidates and is never sufficient for promotion.
     """
     from igu_sentinel.detect import isoforest
-
-    global _baseline_model_state
-
-    with _lock:
-        pool = list(flows) if flows is not None else list(_confirmed_benign)
-        baseline = list(_baseline_distribution or [])
-
-    if len(pool) < MIN_RETRAIN_SAMPLES:
-        _log_event(
-            f"Retrain skipped: only {len(pool)} confirmed-benign flows "
-            f"(need {MIN_RETRAIN_SAMPLES})"
-        )
+    if os.environ.get("IGU_CONFIDENCE_CALIBRATION"):
+        _log_event("Retrain REFUSED: calibrated deployments require offline retraining and recalibration")
         return False
-
-    # 1. Permanent fallback — captured once, never replaced.
-    previous_state = isoforest.snapshot_state()
-    with _lock:
-        if _baseline_model_state is None and previous_state is not None:
-            _baseline_model_state = previous_state
-            _log_event("Original baseline model snapshotted as permanent fallback")
-
-    # 2. Candidate retrain.
-    try:
-        isoforest.train_isoforest(pool)
-    except Exception as exc:
-        _log_event(f"Retrain FAILED ({type(exc).__name__}: {exc}) — previous model retained")
-        if previous_state is not None:
-            isoforest.restore_state(previous_state)
+    if flows is None:
+        _log_event("Retrain skipped: explicit trusted training flows required")
         return False
-
-    # 3. Measure how far the candidate moved the decision boundary.
-    if not baseline:
-        _log_event("Retrain accepted (no baseline distribution to bound against)")
-        return True
-
-    candidate_scores = isoforest.score_values(_baseline_sample_flows())
-    if not candidate_scores:
-        _log_event("Retrain accepted (boundary shift not measurable)")
-        return True
-
-    shift = compute_psi(baseline, candidate_scores)
-
-    # 4. Enforce the bound.
-    if shift > MAX_BOUNDARY_SHIFT_PSI:
-        if previous_state is not None:
-            isoforest.restore_state(previous_state)
-        _log_event(
-            f"Retrain REFUSED: boundary shift PSI={shift:.4f} exceeds bound "
-            f"{MAX_BOUNDARY_SHIFT_PSI}. Previous model restored; "
-            f"original baseline preserved as fallback."
-        )
-        return False
-
-    _log_event(
-        f"Bounded retrain accepted on {len(pool)} confirmed-benign flows "
-        f"(boundary shift PSI={shift:.4f} <= {MAX_BOUNDARY_SHIFT_PSI}). "
-        f"Original baseline preserved as fallback."
-    )
-    with _lock:
-        _confirmed_benign.clear()
-    return True
-
-
-def _baseline_sample_flows() -> List[FlowRecord]:
-    """Flows used to re-measure the boundary after a retrain.
-
-    The confirmed-benign pool doubles as the probe set: if scoring it through
-    the candidate model yields a very different distribution from the original
-    baseline, the boundary moved too far.
-    """
-    with _lock:
-        return list(_confirmed_benign)
+    with _retrain_lock:
+        with _lock:
+            reference = list(_reference_flows)
+            baseline = list(_baseline_distribution or [])
+        pool = list(flows[:MAX_RETRAIN_SAMPLES])
+        if len(pool) < MIN_RETRAIN_SAMPLES:
+            _log_event("Retrain skipped: insufficient trusted samples")
+            return False
+        if not reference or not baseline:
+            _log_event("Retrain REFUSED: trusted fixed reference is missing")
+            return False
+        previous = isoforest.snapshot_state()
+        try:
+            candidate = isoforest.fit_candidate(pool)
+            scores = isoforest.score_values(reference, state=candidate)
+            shift = compute_psi(baseline, scores)
+            if not math.isfinite(shift) or shift > MAX_BOUNDARY_SHIFT_PSI:
+                _log_event(f"Retrain REFUSED: reference PSI={shift:.4f}")
+                return False
+            # Do not overwrite a concurrently installed model.
+            with isoforest._state_lock:
+                if isoforest._state is not previous:
+                    _log_event("Retrain REFUSED: serving model changed during evaluation")
+                    return False
+                isoforest.persist_state(candidate, len(pool))
+                isoforest._state = candidate
+            _log_event(f"Bounded retrain accepted: n={len(pool)}, PSI={shift:.4f}")
+            return True
+        except Exception as exc:
+            _log_event(f"Retrain FAILED: {type(exc).__name__}: {exc}")
+            return False
 
 
 def rollback_to_baseline() -> bool:
@@ -381,6 +339,7 @@ def reset_retrain_log() -> None:
     with _lock:
         _baseline_distribution = None
         _baseline_model_state = None
+        _reference_flows.clear()
         _recent_scores.clear()
         _confirmed_benign.clear()
         _retrain_log = []
