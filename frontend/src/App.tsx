@@ -3,7 +3,8 @@
  * Composes hooks and components into the operational dashboard.
  * Deliberately not a giant component — all rendering logic lives in components.
  */
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
+import { authStatus, login, logout } from './api/client';
 import { useHealth } from './hooks/useHealth';
 import { useCaptureStatus } from './hooks/useCaptureStatus';
 import { useAlertStream } from './hooks/useAlertStream';
@@ -16,6 +17,31 @@ import { CaptureControl } from './components/CaptureControl';
 import type { CaptureSnapshot } from './api/types';
 
 export default function App() {
+  const [authenticated, setAuthenticated] = useState(false);
+  const [checking, setChecking] = useState(true);
+  const [token, setToken] = useState('');
+  const [error, setError] = useState('');
+  useEffect(() => { authStatus().then(s => setAuthenticated(s.authenticated))
+    .catch(() => setError('Unable to reach the API.'))
+    .finally(() => setChecking(false)); }, []);
+  if (checking) return <main className="panel">Connecting…</main>;
+  if (!authenticated) return <main className="panel" style={{ maxWidth: 420, margin: '15vh auto', padding: 24 }}>
+    <h1>Sign in to IGU Sentinel</h1>
+    <form onSubmit={async e => { e.preventDefault(); setError('');
+      try { await login(token); setToken(''); setAuthenticated(true); }
+      catch { setError('Sign-in failed. Check your token and connection.'); }
+    }}>
+      <label htmlFor="api-token">Operator token</label>
+      <input id="api-token" type="password" autoComplete="current-password" required
+        value={token} onChange={e => setToken(e.target.value)} />
+      <button type="submit">Sign in</button>
+      {error && <p role="alert">{error}</p>}
+    </form>
+  </main>;
+  return <><button onClick={async () => { await logout(); setAuthenticated(false); }}>Sign out</button><Dashboard /></>;
+}
+
+function Dashboard() {
   const apiState = useHealth();
   const { snapshot, refresh } = useCaptureStatus();
   const { streamState, alerts, threatCounts, timeline } = useAlertStream();

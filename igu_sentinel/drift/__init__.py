@@ -41,6 +41,7 @@ MAX_BOUNDARY_SHIFT_PSI = 0.35
 
 # Minimum confirmed-benign flows before a retrain is worth attempting.
 MIN_RETRAIN_SAMPLES = 50
+MAX_RETRAIN_SAMPLES = 5000
 
 # Rolling window of recent isoforest scores kept for the drift comparison.
 ROLLING_WINDOW = 500
@@ -61,6 +62,7 @@ _retrain_log: List[str] = []
 def _log_event(message: str) -> None:
     entry = f"[{datetime.now().isoformat()}] {message}"
     _retrain_log.append(entry)
+    del _retrain_log[:-1000]
     log.info("drift: %s", message)
 
 
@@ -243,6 +245,7 @@ def submit_confirmed_benign(flows: Sequence[FlowRecord]) -> int:
     """
     with _lock:
         _confirmed_benign.extend(flows)
+        del _confirmed_benign[:-MAX_RETRAIN_SAMPLES]
         return len(_confirmed_benign)
 
 

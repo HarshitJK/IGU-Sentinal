@@ -333,4 +333,15 @@ def test_alert_persistence_and_recovery(tmp_path, monkeypatch):
     assert parsed3["seq"] == 2
     assert parsed3["prev_hash"] == json.loads(entry2)["hash"]
     print("✓ test_alert_persistence_and_recovery passed")
-
+def test_persistence_failure_does_not_advance_chain(tmp_path, monkeypatch):
+    import pytest
+    from igu_sentinel.alert import get_chain_head, _clear_log
+    _clear_log()
+    monkeypatch.setenv("IGU_ALERT_LOG_PATH", str(tmp_path))
+    before = get_chain_head()
+    alert = Alert(timestamp=datetime.now(), flow_id="disk-failure",
+                  threat_class="recon_scanning", confidence_score=0.8,
+                  evidence=["fanout"])
+    with pytest.raises(OSError):
+        log_alert(alert)
+    assert get_chain_head() == before

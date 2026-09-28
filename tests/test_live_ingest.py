@@ -21,6 +21,48 @@ from igu_sentinel.ingest import (
 from igu_sentinel.schemas import FlowRecord, Alert
 
 
+def test_udp_ingest_validates_records_and_never_sends(monkeypatch):
+    import socket
+    from unittest.mock import MagicMock
+    from pathlib import Path
+    record = Path("tests/fixtures/c2_beaconing_sample.jsonl").read_text().splitlines()[0].encode()
+    sock = MagicMock()
+    sock.__enter__.return_value = sock
+    sock.recvfrom.side_effect = [(b"not-json", ("127.0.0.1", 1)), (record, ("127.0.0.1", 1)), socket.timeout()]
+    monkeypatch.setattr(ingest.socket, "socket", lambda *args: sock)
+    counters = {}
+    stream = ingest.extract_flows_from_udp(stop_event=threading.Event(), counters=counters)
+    flows = next(stream)
+    stream.close()
+    assert len(flows) == 1
+    assert counters["invalid_datagrams"] == 1
+    sock.send.assert_not_called()
+    sock.sendto.assert_not_called()
+
+
+def test_replay_uses_fixed_windows_and_distinct_flow_ids():
+    packets = [_packet("10.0.0.1", 1234, "10.0.0.2", 443, 80, ts) for ts in (12.01, 12.02, 12.14)]
+    windows = list(ingest.flow_windows_from_packets(packets))
+    assert len(windows) == 2
+    assert windows[0][0].flow_id != windows[1][0].flow_id
+    assert windows[0][0].inter_arrival_stats["mean"] == pytest.approx(.01)
+    assert windows[1][0].inter_arrival_stats["mean"] == 0
+
+
+def test_replay_state_does_not_leak_between_captures():
+    packets = [_packet("10.0.0.1", 1000 + i, "10.0.0.2", 443, 80, 30 * i + .01) for i in range(4)]
+    windows = list(ingest.flow_windows_from_packets(packets))
+    assert windows[-1][0].beacon_interval_stats["mean"] == pytest.approx(30)
+    fresh = list(ingest.flow_windows_from_packets(packets[-1:]))
+    assert fresh[0][0].beacon_interval_stats is None
+
+
+def test_beacon_long_intervals_fit_history_horizon():
+    packets = [_packet("10.0.0.1", 1000 + i, "10.0.0.2", 443, 80, 300 * i + .01) for i in range(4)]
+    windows = list(ingest.flow_windows_from_packets(packets))
+    assert windows[-1][0].beacon_interval_stats["mean"] == pytest.approx(300)
+
+
 # ── Helpers: a fake tshark process emitting -T json array text ────────────────
 
 def _packet(src_ip, sport, dst_ip, dport, length, ts, proto="tcp"):
@@ -191,7 +233,7 @@ def test_live_capture_broadcasts_alert_over_websocket(monkeypatch):
 
     attack_window = _load_fixture("volumetric_ddos", 2)
 
-    def fake_live(interface, window_ms=120, stop_event=None, _popen=None):
+    def fake_live(interface, window_ms=120, stop_event=None, _popen=None, counters=None):
         # First window: real attack flows. Then idle windows until stopped.
         yield attack_window
         while stop_event is None or not stop_event.is_set():
@@ -243,7 +285,7 @@ def test_capture_start_reports_error_without_crashing(monkeypatch):
     from fastapi.testclient import TestClient
     import igu_sentinel.api as api
 
-    def failing_live(interface, window_ms=120, stop_event=None, _popen=None):
+    def failing_live(interface, window_ms=120, stop_event=None, _popen=None, counters=None):
         raise LiveCaptureError(f"tshark could not capture on interface '{interface}': permission denied")
         yield  # pragma: no cover  (make it a generator)
 

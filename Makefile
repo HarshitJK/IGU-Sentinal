@@ -4,6 +4,7 @@
 # plugin; hardcoding v1 made every container target fail on a current install.
 COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo "docker-compose")
 PY := .venv/bin/python
+PYTHON ?= python3.12
 
 .PHONY: help venv build up down logs test test-unit benchmark diode-proof gen-data clean frontend frontend-dev frontend-open frontend-check dashboard
 
@@ -14,13 +15,13 @@ help: ## Show descriptions of all available targets
 	@echo "  help           - Show one-line descriptions of all available targets"
 	@echo "  build          - Build Docker images using $(COMPOSE) build"
 	@echo "  up             - Start containers in background using $(COMPOSE) up -d"
-	@echo "  down           - Stop and remove containers and volumes using $(COMPOSE) down -v"
+	@echo "  down           - Stop containers (preserve alert history) using $(COMPOSE) down"
 	@echo "  logs           - Tail container logs using $(COMPOSE) logs -f"
 	@echo "  venv           - Create .venv and install pinned requirements"
 	@echo "  test           - Run full pytest suite (source .venv, pytest -v)"
 	@echo "  test-unit      - Run fast unit tests without Docker dependencies (pytest -v)"
-	@echo "  diode-proof    - Start stack, run prod-test -> enclave-test ping check, print pass/fail, then stop stack"
-	@echo "  benchmark      - Measure sustained flows/sec and end-to-end latency"
+	@echo "  diode-proof    - Verify forward ingest and reverse DROP counters; leave stack running"
+	@echo "  benchmark      - Measure in-process scoring flows/sec and batch latency"
 	@echo "  gen-data       - Generate labeled datasets from YAML configs into datasets/ directory"
 	@echo "  frontend       - Start the Sentinel API and serve live dashboard at http://localhost:8000/dashboard"
 	@echo "  frontend-dev   - Start Sentinel API in auto-reload development mode for frontend iteration"
@@ -29,9 +30,9 @@ help: ## Show descriptions of all available targets
 	@echo "  clean          - Remove __pycache__, .pytest_cache, and prompt before removing .venv"
 
 venv: ## Create .venv and install pinned requirements
-	python3 -m venv .venv
+	$(PYTHON) -m venv .venv
 	$(PY) -m pip install --upgrade pip
-	$(PY) -m pip install -r requirements.txt
+	$(PY) -m pip install -r requirements.lock
 	@echo "Virtualenv ready. Run 'make test'."
 
 build: ## Build Docker images
@@ -40,8 +41,8 @@ build: ## Build Docker images
 up: ## Start containers in background
 	$(COMPOSE) up -d
 
-down: ## Stop and remove containers and volumes
-	$(COMPOSE) down -v
+down: ## Stop containers (preserve alert history)
+	$(COMPOSE) down
 
 logs: ## Tail container logs
 	$(COMPOSE) logs -f
@@ -49,24 +50,15 @@ logs: ## Tail container logs
 test: ## Run full pytest suite with virtualenv activated
 	bash -c "source .venv/bin/activate && pytest -v"
 
-test-unit: ## Run fast unit tests without Docker dependencies
-	bash -c "source .venv/bin/activate && pytest -v --ignore=tests/test_diode.py --ignore=tests/test_docker_compose.py --ignore=tests/test_docker_compose_static.py --ignore=tests/test_docker_networks.py --ignore=tests/test_traffic_gen_containers.py"
+test-unit: ## Run unit tests and static infra checks without starting Docker
+	SKIP_DOCKER_TESTS=1 $(PY) -m pytest -v
 
-diode-proof: ## Up stack, run prod-test -> enclave-test ping check, print pass/fail, then down
-	@echo "Starting containers..."
+diode-proof: ## Prove forward delivery, blocked return traffic, and live scoring
 	$(COMPOSE) up -d
-	@sleep 3
-	@echo "Testing diode return-path ping (prod-test -> enclave-test)..."
-	@if docker exec igusentinel-prod-test ping -c 1 -W 2 igusentinel-enclave-test >/dev/null 2>&1; then \
-		echo "diode-proof: FAIL (traffic passed through, diode failed to block)"; \
-		$(COMPOSE) down -v; \
-		exit 1; \
-	else \
-		echo "diode-proof: PASS (return traffic blocked by diode iptables)"; \
-	fi
-	$(COMPOSE) down -v
+	$(PY) scripts/verify-diode.py
 
-benchmark: ## Measure sustained flows/sec and end-to-end latency through the pipeline
+
+benchmark: ## Measure in-process scoring flows/sec and batch latency
 	bash -c "source .venv/bin/activate && python -m igu_sentinel.benchmark --flows 2000 --repeats 3"
 
 gen-data: ## Run traffic generator against all configs and output to datasets/
@@ -130,4 +122,4 @@ gen-data-lab: ## Generate REAL lab traffic from lab_ddos.yaml (lab network ONLY)
 	@echo "# igu_sentinel/traffic_gen/config/lab_ddos.yaml first."
 	@echo "# hping3 floods require root; install tshark/hping3/iperf3."
 	@echo "############################################################"
-	bash -c "source .venv/bin/activate && python -m igu_sentinel.traffic_gen.runner igu_sentinel/traffic_gen/config/lab_ddos.yaml"
+	bash -c "source .venv/bin/activate && python -m igu_sentinel.traffic_gen.runner igu_sentinel/traffic_gen/config/lab_ddos.yaml --allow-lab"

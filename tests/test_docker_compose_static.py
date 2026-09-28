@@ -16,14 +16,14 @@ def test_dockerfile_exists_and_valid():
         content = f.read()
 
     # Verify key components
-    assert "python:3.11-slim" in content, "Must use Python 3.11-slim base image"
+    assert "python:3.12-slim" in content, "Served XGBoost model requires Python 3.12+"
     assert "requirements.txt" in content, "Must copy requirements.txt"
     assert "igu_sentinel" in content, "Must copy igu_sentinel module"
     assert "tests/fixtures" in content, "Must copy test fixtures"
     assert "uvicorn" in content, "Must use uvicorn to run app"
     assert "igu_sentinel.api:app" in content, "Must reference FastAPI app"
     assert "8000" in content, "Must expose port 8000"
-    assert "/health" in content, "Must have health check"
+    assert "/ready" in content, "Container health must verify scoring readiness"
 
     print("✓ Dockerfile has all required components:")
     print("  - Base image: python:3.11-slim")
@@ -75,7 +75,8 @@ def test_sentinel_service_configured():
     else:
         network_names = networks
 
-    assert "prod-net" in network_names, "Sentinel must be on prod-net"
+    assert "enclave-net" in network_names, "Sentinel must be inside the enclave"
+    assert "prod-net" not in network_names, "The monitor must have no production interface"
 
     # Check port
     ports = sentinel.get("ports", [])

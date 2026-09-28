@@ -78,7 +78,7 @@ def test_sentinel_service_defined():
         f"Available services: {list(services.keys())}"
     )
 
-    # Sentinel should be on prod-net
+    # Sentinel should be isolated on enclave-net
     sentinel_service = services['sentinel']
     networks = sentinel_service.get('networks', [])
 
@@ -90,11 +90,11 @@ def test_sentinel_service_defined():
     else:
         network_names = []
 
-    assert 'prod-net' in network_names, (
-        f"sentinel service must be on 'prod-net'. Networks: {network_names}"
+    assert 'enclave-net' in network_names and 'prod-net' not in network_names, (
+        f"sentinel must be isolated on 'enclave-net'. Networks: {network_names}"
     )
 
-    print(f"✓ Sentinel service defined and on prod-net")
+    print(f"✓ Sentinel service defined and on enclave-net")
 
 
 def test_sentinel_service_starts():
@@ -121,16 +121,16 @@ def test_sentinel_health_endpoint():
     try:
         docker_compose_up()
 
-        # Get sentinel container IP on prod-net
+        # Get sentinel container IP on enclave-net
         stdout, stderr, rc = run_command(
-            "docker inspect igusentinel-sentinel --format='{{range $k,$v := .NetworkSettings.Networks}}{{if eq $k \"prod-net\"}}{{$v.IPAddress}}{{end}}{{end}}'"
+            "docker inspect igusentinel-sentinel --format='{{range $k,$v := .NetworkSettings.Networks}}{{if eq $k \"enclave-net\"}}{{$v.IPAddress}}{{end}}{{end}}'"
         )
 
         if rc != 0 or not stdout:
             raise RuntimeError(f"Could not get sentinel IP: {stderr}")
 
         sentinel_ip = stdout.strip()
-        print(f"✓ Sentinel IP on prod-net: {sentinel_ip}")
+        print(f"✓ Sentinel IP on enclave-net: {sentinel_ip}")
 
         # Try health endpoint (may need retries as app starts)
         for attempt in range(10):
@@ -179,25 +179,12 @@ def test_all_services_running():
 
 
 def test_diode_blocks_return_traffic():
-    """Verify diode is still blocking return traffic (ping from prod to enclave fails)."""
+    """Require positive forward delivery AND observed reverse drops."""
+    import sys
     try:
         docker_compose_up()
-
-        # Try to ping from prod-test to enclave-test via diode
-        # This should fail because diode blocks return traffic
-        stdout, stderr, rc = run_command(
-            "docker exec igusentinel-prod-test ping -c 1 -W 2 igusentinel-enclave-test 2>&1 || true"
-        )
-
-        # If ping fails with timeout or no route, that's correct (diode blocking)
-        if rc != 0:
-            print(f"✓ Diode blocks return traffic (ping failed as expected)")
-        else:
-            # If it succeeded, check if it was from enclave->prod (which should be allowed)
-            # Actually, prod->enclave should be blocked, so this test mainly confirms
-            # the diode setup is active
-            print(f"✓ Diode setup verified (traffic control active)")
-
+        proof = Path(__file__).resolve().parents[1] / "scripts" / "verify-diode.py"
+        subprocess.run([sys.executable, str(proof)], check=True, timeout=90)
     finally:
         docker_compose_down()
 

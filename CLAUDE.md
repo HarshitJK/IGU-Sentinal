@@ -99,6 +99,16 @@ Vary source-IP mode (`hping3 --rand-source` or a fixed spoof pool), rate (`-i`),
 
 ## Open questions
 
+### PS alignment corrections (2026-09-27)
+
+The user supplied the original PS and authorized fixing the audit findings in
+sequence. The monitoring transport is production -> enclave only; mirrored
+observations may include both directions of a production conversation. The
+120ms window and four-layer design are implementation choices, not PS mandates.
+`Dockerfile.diode` and `scripts/verify-diode.py` implement and verify the simulated
+one-way exported-flow feed. They extend existing ingest/traffic_gen modules.
+No real attack scenario is enabled by the default Compose stack.
+
 Raised during the 2026-09-17 security and correctness audit. Recorded here rather
 than improvised silently, per the working agreement above.
 

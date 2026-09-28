@@ -140,19 +140,16 @@ def log_alert(alert: Alert) -> str:
         }
         log_entry_json = json.dumps(log_entry)
 
+        # Commit to memory only after the configured append succeeds. Surface
+        # storage errors so capture/readiness cannot silently report success.
+        log_path = os.environ.get("IGU_ALERT_LOG_PATH")
+        if log_path:
+            os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(log_entry_json + "\n")
         _alert_log.append(log_entry_json)
         _chain_head = entry_hash
         _next_seq = seq + 1
-
-        # Durable disk persistence (R15)
-        log_path = os.environ.get("IGU_ALERT_LOG_PATH")
-        if log_path:
-            try:
-                os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(log_entry_json + "\n")
-            except OSError:
-                pass
 
     return log_entry_json
 
@@ -298,4 +295,5 @@ def restore_chain_from_disk(filepath: Optional[str] = None) -> bool:
 
 # Auto-restore state on import if configured
 if os.environ.get("IGU_ALERT_LOG_PATH"):
-    restore_chain_from_disk()
+    if not restore_chain_from_disk():
+        raise RuntimeError("Configured alert log could not be verified and restored")

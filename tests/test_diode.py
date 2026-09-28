@@ -1,8 +1,8 @@
 """Test diode container one-way relay enforcement.
 
 A diode enforces unidirectional traffic:
-- Outbound from enclave-net to prod-net is allowed via iptables ACCEPT
-- Inbound from prod-net to enclave-net is blocked via iptables DROP
+- Observation traffic from prod-net to enclave-net is allowed
+- Return traffic from enclave-net to prod-net is blocked
 """
 import subprocess
 import time
@@ -124,11 +124,11 @@ def test_diode_iptables_rules_configured():
     assert "iptables -P FORWARD DROP" in command, (
         "Diode must set the iptables FORWARD policy to DROP"
     )
-    assert '-i "$$ENCL_IF" -o "$$PROD_IF" -j ACCEPT' in command, (
-        "Diode must allow enclave -> prod forwarding"
+    assert '-i "$$PROD_IF" -o "$$ENCL_IF" -j ACCEPT' in command, (
+        "Diode must allow production -> enclave forwarding"
     )
-    assert '-i "$$PROD_IF" -o "$$ENCL_IF" -j DROP' in command, (
-        "Diode must DROP the prod -> enclave return path"
+    assert '-i "$$ENCL_IF" -o "$$PROD_IF" -j DROP' in command, (
+        "Diode must DROP the enclave -> production return path"
     )
 
     # Interfaces resolved from subnets, not assumed from Docker's ordering.
@@ -271,78 +271,12 @@ def test_networks_exist_and_separate():
 
 
 def test_one_way_relay_proof_artifact():
-    """Generate proof artifact showing one-way relay setup."""
+    """Produce measured proof, not descriptions of the intended configuration."""
+    import sys
     try:
         docker_compose_up()
-
-        # Collect evidence of one-way relay setup
-        proof_lines = []
-        proof_lines.append("=== Diode One-Way Relay Configuration Proof ===")
-        proof_lines.append("")
-
-        # 1. Docker Compose Configuration
-        root_dir = Path(__file__).parent.parent
-        compose_file = root_dir / "docker-compose.yml"
-        with open(compose_file) as f:
-            content = f.read()
-
-        proof_lines.append("1. Docker Compose Configuration (docker-compose.yml):")
-        proof_lines.append("   - Diode on both networks: prod-net and enclave-net")
-        proof_lines.append("   - NET_ADMIN capability enabled: YES")
-        proof_lines.append("   - iptables rules configured:")
-        proof_lines.append("     * FORWARD policy: DROP (deny by default)")
-        proof_lines.append("     * eth0->eth1: ACCEPT (enclave to prod, outbound allowed)")
-        proof_lines.append("     * eth1->eth0: DROP (prod to enclave, return blocked)")
-        proof_lines.append("")
-
-        # 2. Running Containers
-        proof_lines.append("2. Running Containers:")
-        stdout, stderr, rc = run_command(
-            "docker ps -f name=igusentinel --format='{{.Names}} {{.State}}'"
-        )
-        for line in stdout.split('\n'):
-            if line.strip():
-                proof_lines.append(f"   {line}")
-        proof_lines.append("")
-
-        # 3. Container Networks
-        proof_lines.append("3. Diode Container Network Attachment:")
-        stdout, stderr, rc = run_command(
-            "docker inspect igusentinel-diode --format='{{range $k,$v := .NetworkSettings.Networks}}{{$k}}: {{$v.IPAddress}}{{\"\\n\"}}{{end}}'"
-        )
-        for line in stdout.split('\n'):
-            if line.strip():
-                proof_lines.append(f"   {line}")
-        proof_lines.append("")
-
-        # 4. Diode Startup Logs
-        proof_lines.append("4. Diode Startup Logs (iptables configuration):")
-        stdout, stderr, rc = run_command(
-            "docker logs igusentinel-diode 2>&1"
-        )
-        for line in stdout.split('\n'):
-            if line.strip():
-                proof_lines.append(f"   {line}")
-        proof_lines.append("")
-
-        # 5. Network Architecture
-        proof_lines.append("5. Network Architecture:")
-        proof_lines.append("   enclave-test ---[enclave-net]---> diode ---[prod-net]---> prod-test")
-        proof_lines.append("                                      |")
-        proof_lines.append("                   iptables blocks return")
-        proof_lines.append("                       (eth1->eth0 DROP)")
-        proof_lines.append("")
-
-        proof_artifact = "\n".join(proof_lines)
-        print("\n" + proof_artifact)
-
-        # Save artifact
-        artifact_path = root_dir / ".diode-proof-artifact.txt"
-        with open(artifact_path, 'w') as f:
-            f.write(proof_artifact)
-
-        print(f"\n✓ Proof artifact saved to {artifact_path}")
-
+        proof = Path(__file__).resolve().parents[1] / "scripts" / "verify-diode.py"
+        subprocess.run([sys.executable, str(proof)], check=True, timeout=90)
     finally:
         docker_compose_down()
 

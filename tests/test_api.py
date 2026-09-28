@@ -283,3 +283,56 @@ def test_api_websocket_rejects_disallowed_origin(monkeypatch):
     ) as ws:
         assert ws is not None
     print("✓ test_api_websocket_rejects_disallowed_origin passed")
+
+
+def test_dashboard_never_discloses_token(monkeypatch):
+    from fastapi.testclient import TestClient
+    from igu_sentinel.api import app
+
+    monkeypatch.setenv("IGU_API_TOKEN", "dashboard-regression-secret")
+    with TestClient(app) as client:
+        response = client.get("/dashboard")
+        assert response.status_code == 200
+        assert "dashboard-regression-secret" not in response.text
+        assert response.headers["cache-control"] == "no-store"
+
+
+def test_readiness_reports_model_and_capture_failures(monkeypatch):
+    from fastapi.testclient import TestClient
+    from igu_sentinel.api import app, capture
+    import igu_sentinel.detect.xgb as xgb
+    with TestClient(app) as client:
+        assert client.get("/ready").status_code == 200
+        monkeypatch.setattr(xgb, "_state", None)
+        assert client.get("/ready").status_code == 503
+    monkeypatch.undo()
+    with TestClient(app) as client:
+        monkeypatch.setitem(capture.state, "status", "error")
+        assert client.get("/ready").status_code == 503
+
+
+def test_browser_session_requires_login_and_rejects_cross_origin(monkeypatch):
+    from fastapi.testclient import TestClient
+    from igu_sentinel.api import app
+    from starlette.websockets import WebSocketDisconnect
+    import pytest
+
+    monkeypatch.setenv("IGU_API_TOKEN", "session-regression-secret")
+    monkeypatch.delenv("IGU_ALLOWED_ORIGINS", raising=False)
+    with TestClient(app, base_url="https://testserver") as client:
+        assert client.post("/auth/login").status_code == 401
+        login = client.post("/auth/login", headers={"Authorization": "Bearer session-regression-secret"})
+        assert login.status_code == 200
+        cookie = login.headers["set-cookie"].lower()
+        assert "httponly" in cookie and "samesite=strict" in cookie and "secure" in cookie
+        assert "session-regression-secret" not in cookie
+        assert client.get("/capture/status").status_code == 200
+        assert client.post("/detect", json=[], headers={"Origin": "https://evil.example"}).status_code == 403
+        assert client.post("/detect", json=[], headers={"Origin": "https://testserver"}).status_code == 200
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("wss://testserver/ws/alerts", headers={"Origin": "https://evil.example"}):
+                pass
+        with client.websocket_connect("wss://testserver/ws/alerts", headers={"Origin": "https://testserver"}):
+            pass
+        assert client.post("/auth/logout", headers={"Origin": "https://testserver"}).status_code == 200
+        assert client.get("/capture/status").status_code == 401

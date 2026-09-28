@@ -8,14 +8,15 @@ export default defineConfig({
     port: 5173,
     proxy: {
       // REST API
+      '/auth': { target: 'http://localhost:8000', changeOrigin: false },
       '/health': { target: 'http://localhost:8000', changeOrigin: true },
-      '/capture': { target: 'http://localhost:8000', changeOrigin: true },
-      '/detect':  { target: 'http://localhost:8000', changeOrigin: true },
+      '/capture': { target: 'http://localhost:8000', changeOrigin: false },
+      '/detect':  { target: 'http://localhost:8000', changeOrigin: false },
       // WebSocket — must use ws: true
       '/ws': {
         target: 'ws://localhost:8000',
         ws: true,
-        changeOrigin: true,
+        changeOrigin: false,
       },
     },
   },

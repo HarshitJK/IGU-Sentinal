@@ -1,5 +1,9 @@
 # IGU Sentinel — Unidirectional AI/ML Network Threat Detection
 
+> **Current status:** prototype under validation. See [verified fixes, measured
+> results, and remaining gaps](VERIFICATION_STATUS.md). Older performance and
+> hardening claims below are not evidence of SIH26145 completion.
+
 > Passive, near real-time AI/ML threat detection for data-diode-fed, one-way network links. Built for **SIH26145** (NTRO — Smart India Hackathon / *Blockchain & Cybersecurity* theme).
 
 ---

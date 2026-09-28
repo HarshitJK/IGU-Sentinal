@@ -1,5 +1,9 @@
 # IGU Sentinel — Complete Project Documentation, Architecture & Status Report
 
+> **Historical report — superseded.** Use [VERIFICATION_STATUS.md](VERIFICATION_STATUS.md)
+> for current evidence. Claims below about production readiness, signed
+> manifests, automatic bounded retraining, and end-to-end latency are not verified.
+
 **Document Version:** 2.4.0 (Authoritative Master Documentation)  
 **Last Updated:** 2026-09-18  
 **Repository:** `IGU-Sentinal 2`  

@@ -269,6 +269,11 @@
             <p>Real-time passive threat detection • Unidirectional traffic analysis</p>
         </header>
 
+        <form id="loginForm" hidden>
+            <label for="operatorToken">Operator token</label>
+            <input id="operatorToken" type="password" autocomplete="current-password" required>
+            <button type="submit">Sign in</button><span id="loginError" role="alert"></span>
+        </form>
         <div class="main-grid">
             <!-- Total Flows & Rate Panel -->
             <div class="panel">
@@ -483,6 +488,12 @@
             updateAlertsTable();
         }
 
+        function escapeHtml(value) {
+            const span = document.createElement('span');
+            span.textContent = value;
+            return span.innerHTML;
+        }
+
         function updateAlertsTable() {
             const tbody = document.getElementById('alertsTable');
 
@@ -506,7 +517,7 @@
                     return `
                         <tr>
                             <td>${time}</td>
-                            <td style="font-family: monospace; font-size: 10px;">${alert.flow_id.slice(-8)}</td>
+                            <td style="font-family: monospace; font-size: 10px;">${escapeHtml(alert.flow_id.slice(-8))}</td>
                             <td class="${getThreatClass(threatClass)}">${threatClass}</td>
                             <td class="${getConfidenceClass(alert.confidence_score)}">${confidence}%</td>
                         </tr>
@@ -517,16 +528,7 @@
 
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            // Read the API token from a meta tag injected by the server.
-            // When IGU_API_TOKEN is set, the /dashboard endpoint template-expands
-            // this tag so the WebSocket handshake carries the same credential.
-            // Browsers cannot set custom headers on a WebSocket connection, so
-            // the token is passed as a query parameter (the backend reads
-            // websocket.query_params.get("token")).
-            const tokenMeta = document.querySelector('meta[name="iguToken"]');
-            const token = tokenMeta ? tokenMeta.getAttribute('content') : '';
-            const wsBase = `${protocol}//${window.location.host}/ws/alerts`;
-            const wsUrl = token ? `${wsBase}?token=${encodeURIComponent(token)}` : wsBase;
+            const wsUrl = `${protocol}//${window.location.host}/ws/alerts`;
 
             const ws = new WebSocket(wsUrl);
 
@@ -550,13 +552,14 @@
                     updateStats();
                     drawChart();
                     updateAlertsTable();
-                } else if (message.type === 'alert') {
+                } else if (message.threat_class) {
                     // New alert
                     addAlert({
                         timestamp: message.timestamp,
                         flow_id: message.flow_id,
                         threat_class: message.threat_class,
                         confidence_score: message.confidence_score,
+                        evidence: message.evidence,
                     });
                 }
             };
@@ -570,12 +573,26 @@
                 document.getElementById('connectionStatus').textContent = '✗ Disconnected';
                 document.getElementById('connectionStatus').style.color = '#ff0044';
                 // Attempt to reconnect after 2 seconds
-                setTimeout(connectWebSocket, 2000);
+                setTimeout(authenticate, 2000);
             };
         }
 
         // Start the dashboard
-        connectWebSocket();
+        async function authenticate() {
+            const response = await fetch('/auth/status');
+            const status = await response.json();
+            document.getElementById('loginForm').hidden = status.authenticated;
+            if (status.authenticated) connectWebSocket();
+        }
+        document.getElementById('loginForm').onsubmit = async event => {
+            event.preventDefault();
+            const input = document.getElementById('operatorToken');
+            const response = await fetch('/auth/login', { method: 'POST', headers: { Authorization: `Bearer ${input.value}` } });
+            input.value = '';
+            if (response.ok) await authenticate();
+            else document.getElementById('loginError').textContent = 'Sign-in failed';
+        };
+        authenticate();
         updateStats();
         drawChart();
 

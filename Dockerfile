@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 # tshark is the only external process the pipeline shells out to (CLAUDE.md).
 # Without it the image can serve /detect but every /capture/* call fails at
@@ -12,8 +12,8 @@ RUN apt-get update \
 WORKDIR /app
 
 # Copy requirements first for layer caching
-COPY requirements.txt .
-RUN pip install --no-cache-dir --default-timeout=600 -r requirements.txt
+COPY requirements.txt requirements.lock ./
+RUN pip install --no-cache-dir --default-timeout=600 -r requirements.lock
 
 # Copy application code
 COPY igu_sentinel/ /app/igu_sentinel/
@@ -26,12 +26,13 @@ COPY models/ /app/models/
 # nothing in the service needs privilege, and root plus a mounted source tree
 # means a bug in the API is a host-level problem.
 RUN useradd --system --create-home --uid 10001 sentinel \
+    && mkdir -p /app/data \
     && chown -R sentinel:sentinel /app
 USER sentinel
 
 # Health check
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8000/health', timeout=2)"
+    CMD python -c "import requests; requests.get('http://localhost:8000/ready', timeout=2).raise_for_status()"
 
 # Run sentinel FastAPI app
 CMD ["uvicorn", "igu_sentinel.api:app", "--host", "0.0.0.0", "--port", "8000"]

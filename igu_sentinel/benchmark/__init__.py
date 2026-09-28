@@ -1,26 +1,11 @@
-"""Throughput and end-to-end latency harness for the detection pipeline.
+"""In-process scoring throughput and batch processing latency.
 
-CLAUDE.md requires a dedicated benchmark harness that measures and logs
-sustained flows/sec and end-to-end latency (capture window + processing), and
-calls it a graded requirement rather than optional polish. Only a *test* existed
-(``tests/test_benchmark.py``) — it printed a number and threw it away, so there
-was nothing any other code or report could call. This module is that harness.
+Inputs are already extracted FlowRecords. This excludes packet capture,
+feature extraction, queueing, log persistence, WebSocket delivery, and rendering.
+Percentiles weight each batch duration by the number of flows in that batch.
+The 120ms window headroom is a scoring budget estimate, not an end-to-end SLA.
 
-What is measured
-----------------
-* **Sustained throughput** — flows/sec over a sustained run, not a single burst,
-  reported as the mean over repeated passes so one lucky pass cannot flatter it.
-* **End-to-end latency** — per-flow, reported as p50/p95/p99 rather than a mean.
-  A mean hides the tail, and the tail is what a bounded-latency claim is about.
-* **Window budget** — the fixed 120ms capture window (CLAUDE.md) sets the real
-  deadline: a window's flows must be scored before the next window closes, or
-  the pipeline falls behind the capture and never catches up. ``window_headroom``
-  reports how much of that budget is left.
-
-Usage::
-
-    python -m igu_sentinel.benchmark                  # fixture-driven
-    python -m igu_sentinel.benchmark --flows 5000 --repeats 5
+Usage: python -m igu_sentinel.benchmark --flows 5000 --repeats 5
 """
 
 import argparse
@@ -88,7 +73,7 @@ class BenchmarkResult:
             f"  flows/sec          : {self.throughput_flows_per_sec:,.1f}"
             f"  (stdev {self.throughput_stdev:,.1f})",
             "",
-            "End-to-end latency per batch (capture window + processing)",
+            "Scoring latency per batch (capture and delivery excluded)",
             f"  p50                : {self.latency_p50_ms:.3f} ms",
             f"  p95                : {self.latency_p95_ms:.3f} ms",
             f"  p99                : {self.latency_p99_ms:.3f} ms",
@@ -152,7 +137,7 @@ def run_benchmark(
     batch_size: int = 128,
     pipeline: Optional[Callable[[List[FlowRecord]], list]] = None,
 ) -> BenchmarkResult:
-    """Measure sustained throughput and end-to-end latency through the pipeline.
+    """Measure in-process scoring throughput and batch latency.
 
     Args:
         flows: Flows to score. Defaults to the fixture corpus, repeated to
@@ -199,8 +184,7 @@ def run_benchmark(
             t0 = time.perf_counter()
             pipeline(batch)
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            # End-to-end latency for a flow is the time for its whole window to
-            # be scored: no alert leaves the pipeline before its window is done.
+            # Attribute the batch scoring duration to each flow in the batch.
             latencies_ms.extend([elapsed_ms] * len(batch))
         pass_elapsed = time.perf_counter() - pass_start
         if pass_elapsed > 0:

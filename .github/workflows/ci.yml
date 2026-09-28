@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.lock
 
       # tshark is what ingest/ shells out to. Without it the live-capture tests
       # exercise only the error path.
@@ -38,7 +38,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
 
       - name: Run test suite
-        run: pytest -v
+        run: SKIP_DOCKER_TESTS=1 pytest -v
 
       # Throughput is a graded requirement (CLAUDE.md), so the number is
       # produced on every run rather than quoted from memory.
@@ -65,13 +65,22 @@ jobs:
           docker compose logs diode
           # The diode must have verified its own rules and reported ready.
           docker compose logs diode | grep -q 'Diode online'
-          echo "--- return-path test (must FAIL to pass) ---"
-          if docker exec igusentinel-prod-test ping -c 1 -W 2 igusentinel-enclave-test; then
-            echo "FAIL: return traffic reached the enclave"
-            exit 1
-          fi
-          echo "PASS: return traffic blocked"
+          python scripts/verify-diode.py
 
       - name: Tear down
         if: always()
         run: docker compose down -v
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend

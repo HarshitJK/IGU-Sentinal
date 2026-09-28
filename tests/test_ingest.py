@@ -1,5 +1,6 @@
 """Test tshark-based flow ingest and feature extraction."""
 import json
+import io
 import pytest
 import subprocess
 import struct
@@ -206,12 +207,15 @@ def test_extract_flows_from_pcap_with_mock():
     ])
 
     # Patch subprocess.run to return our mock data
-    with patch('igu_sentinel.ingest.subprocess.run') as mock_run:
+    with patch('igu_sentinel.ingest.subprocess.Popen') as mock_run:
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout=mock_tshark_output,
+            stdout=io.StringIO(mock_tshark_output),
             stderr=""
         )
+
+        mock_run.return_value.wait.return_value = 0
+        mock_run.return_value.poll.return_value = 0
 
         # Extract flows
         flows = extract_flows_from_pcap("/tmp/test.pcap")
@@ -278,12 +282,15 @@ def test_extract_flows_from_pcap(tmp_path):
         }
     ])
 
-    with patch('igu_sentinel.ingest.subprocess.run') as mock_run:
+    with patch('igu_sentinel.ingest.subprocess.Popen') as mock_run:
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout=mock_tshark_output,
+            stdout=io.StringIO(mock_tshark_output),
             stderr=""
         )
+
+        mock_run.return_value.wait.return_value = 0
+        mock_run.return_value.poll.return_value = 0
 
         # Extract flows
         flows = extract_flows_from_pcap(str(pcap_file))
@@ -377,7 +384,8 @@ def test_extract_ja4_from_pcap_tls(tmp_path):
     assert tls_flow.dst_port == 443
     assert tls_flow.ja4 is not None, "JA4 should be extracted for TLS Client Hello"
     assert len(tls_flow.ja4) == 36
-    assert tls_flow.ja4.startswith("t13d0501h2_")
+    # Canonical JA4 counts SNI and ALPN in _a, but omits them from _c.
+    assert tls_flow.ja4 == "t13d0503h2_e133e205ac38_b9a491fefe05"
     print(f"✓ Successfully extracted JA4: {tls_flow.ja4}")
 
 

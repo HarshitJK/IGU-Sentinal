@@ -153,6 +153,7 @@ def compute_ja4(
     alpn: Optional[str] = None,
     sni: Optional[str] = None,
     supported_versions: Optional[List[Union[int, str]]] = None,
+    signature_algorithms: Optional[List[Union[int, str]]] = None,
 ) -> str:
     """Compute 36-character JA4 fingerprint for a TLS/QUIC Client Hello.
 
@@ -188,10 +189,12 @@ def compute_ja4(
 
     # Filter non-GREASE, non-SNI (0), non-ALPN (16) extensions
     valid_exts: List[int] = []
+    extension_count = 0
     if extension_types:
         for e in extension_types:
             ie = _to_int(e)
             if ie is not None and not is_grease(ie):
+                extension_count += 1
                 # SNI = 0x0000 (0), ALPN = 0x0010 (16)
                 if ie not in (0, 16):
                     valid_exts.append(ie)
@@ -200,7 +203,7 @@ def compute_ja4(
     cipher_count_str = f"{min(len(valid_ciphers), 99):02d}"
 
     # [6:8] Extension count (max 99)
-    ext_count_str = f"{min(len(valid_exts), 99):02d}"
+    ext_count_str = f"{min(extension_count, 99):02d}"
 
     # [8:10] ALPN (2 chars)
     alpn_str = _resolve_alpn(alpn)
@@ -219,7 +222,12 @@ def compute_ja4(
     # Sorted list of 4-character hex extensions joined by comma
     if valid_exts:
         sorted_exts = sorted(_format_hex4(e) for e in valid_exts)
-        ja4_c = hashlib.sha256(",".join(sorted_exts).encode()).hexdigest()[:12]
+        preimage = ",".join(sorted_exts)
+        signatures = [_format_hex4(v) for raw in (signature_algorithms or [])
+                      if (v := _to_int(raw)) is not None and not is_grease(v)]
+        if signatures:
+            preimage += "_" + ",".join(signatures)
+        ja4_c = hashlib.sha256(preimage.encode()).hexdigest()[:12]
     else:
         ja4_c = "000000000000"
 

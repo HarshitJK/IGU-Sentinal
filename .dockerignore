@@ -7,3 +7,9 @@ __pycache__/
 .diode-proof-artifact.txt
 *.log
 .env
+node_modules/
+frontend/node_modules/
+frontend/dist/
+datasets/
+data/
+.env.*

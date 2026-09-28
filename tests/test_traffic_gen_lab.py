@@ -240,6 +240,13 @@ def test_runner_skips_lab_variants_by_default():
     popen.assert_not_called()
 
 
+def test_cli_all_does_not_opt_into_lab():
+    from igu_sentinel.traffic_gen import runner
+    with mock.patch.object(runner, "run_all_configs", return_value=[]) as run:
+        runner.main(["--all"])
+    run.assert_called_once_with(allow_lab=False)
+
+
 def test_runner_runs_lab_when_allowed():
     """With allow_lab=True the lab config dispatches to the (mocked) lab modules."""
     from igu_sentinel.traffic_gen.runner import run_traffic_gen

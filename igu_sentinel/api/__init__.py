@@ -14,6 +14,8 @@ Pipeline Architecture:
 """
 import asyncio
 import hmac
+import hashlib
+import secrets
 import json
 import logging
 import os
@@ -21,10 +23,11 @@ import re
 import threading
 import time
 from datetime import datetime
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional, Set
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from pydantic import ValidationError
@@ -40,10 +43,19 @@ from igu_sentinel.ingest import (
     extract_flows_from_interface,
     LiveCaptureError,
     DEFAULT_WINDOW_MS,
+    extract_flows_from_udp,
 )
 
 log = logging.getLogger(__name__)
-app = FastAPI(title="IGU Sentinel", description="Passive Diode-Fed Threat Detection System")
+@asynccontextmanager
+async def lifespan(app):
+    if os.environ.get("IGU_UDP_PORT"):
+        capture.start(f"udp:{int(os.environ['IGU_UDP_PORT'])}", DEFAULT_WINDOW_MS, asyncio.get_running_loop())
+    yield
+    await asyncio.to_thread(capture.stop)
+
+
+app = FastAPI(title="IGU Sentinel", description="Passive Diode-Fed Threat Detection System", lifespan=lifespan)
 
 # ── Access control ────────────────────────────────────────────────────────────
 # This service exposes packet capture control and a live threat-alert feed. Both
@@ -57,6 +69,32 @@ app = FastAPI(title="IGU Sentinel", description="Passive Diode-Fed Threat Detect
 # demo still runs with no setup; _warn_if_unauthenticated() makes that loud.
 _TOKEN_ENV = "IGU_API_TOKEN"
 _ORIGINS_ENV = "IGU_ALLOWED_ORIGINS"
+_SESSION_COOKIE = "igu_session"
+_SESSION_TTL = 3600
+# Restarting the service invalidates all browser sessions.
+_SESSION_KEY = secrets.token_bytes(32)
+
+
+def _session_signature(payload: str) -> str:
+    return hmac.new(_SESSION_KEY, (payload + (_configured_token() or "")).encode(), hashlib.sha256).hexdigest()
+
+
+def _valid_session(value: str) -> bool:
+    try:
+        expires, nonce, signature = value.split(".")
+        payload = f"{expires}.{nonce}"
+        return int(expires) > time.time() and hmac.compare_digest(signature, _session_signature(payload))
+    except (ValueError, TypeError):
+        return False
+
+
+def _origin_allowed(connection) -> bool:
+    origin = connection.headers.get("origin")
+    if origin is None:
+        return True  # CLI clients do not send Origin.
+    scheme = "https" if connection.url.scheme in ("https", "wss") else "http"
+    same_origin = f"{scheme}://{connection.url.netloc}"
+    return origin == same_origin or origin in _allowed_origins()
 
 # Upper bound on a single /detect request. Without it, one request could pin
 # arbitrary memory and occupy the thread pool indefinitely.
@@ -112,7 +150,7 @@ if _allowed_origins():
     )
 
 
-def require_token(authorization: Optional[str] = Header(default=None)) -> None:
+def require_token(request: Request, authorization: Optional[str] = Header(default=None)) -> None:
     """Reject the request when IGU_API_TOKEN is set and the bearer token is wrong.
 
     Compared with :func:`hmac.compare_digest` so a wrong token cannot be
@@ -124,8 +162,41 @@ def require_token(authorization: Optional[str] = Header(default=None)) -> None:
     supplied = ""
     if authorization and authorization.lower().startswith("bearer "):
         supplied = authorization.split(" ", 1)[1].strip()
-    if not hmac.compare_digest(supplied, expected):
-        raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+    if hmac.compare_digest(supplied, expected):
+        return
+    if _valid_session(request.cookies.get(_SESSION_COOKIE, "")):
+        if not _origin_allowed(request):
+            raise HTTPException(status_code=403, detail="disallowed origin")
+        return
+    raise HTTPException(status_code=401, detail="invalid or missing credentials")
+
+
+@app.get("/auth/status")
+async def auth_status(request: Request):
+    required = _configured_token() is not None
+    return JSONResponse({"required": required, "authenticated": not required or _valid_session(request.cookies.get(_SESSION_COOKIE, ""))}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/auth/login")
+async def login(request: Request, response: Response, authorization: Optional[str] = Header(default=None)):
+    expected = _configured_token()
+    supplied = authorization[7:] if authorization and authorization.lower().startswith("bearer ") else ""
+    if expected and not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="invalid bearer token")
+    if not _origin_allowed(request):
+        raise HTTPException(status_code=403, detail="disallowed origin")
+    payload = f"{int(time.time()) + _SESSION_TTL}.{secrets.token_hex(16)}"
+    response.set_cookie(_SESSION_COOKIE, f"{payload}.{_session_signature(payload)}", max_age=_SESSION_TTL,
+                        httponly=True, secure=request.url.scheme == "https", samesite="strict")
+    response.headers["Cache-Control"] = "no-store"
+    return {"authenticated": True}
+
+
+@app.post("/auth/logout", dependencies=[Depends(require_token)])
+async def logout(response: Response):
+    response.delete_cookie(_SESSION_COOKIE, httponly=True, samesite="strict")
+    response.headers["Cache-Control"] = "no-store"
+    return {"authenticated": False}
 
 
 def _websocket_authorized(websocket: WebSocket) -> bool:
@@ -134,15 +205,15 @@ def _websocket_authorized(websocket: WebSocket) -> bool:
     The browser same-origin policy does not apply to WebSockets, so the Origin
     header must be checked here or any site could subscribe to the alert feed.
     """
-    allowed = _allowed_origins()
-    origin = websocket.headers.get("origin")
     # A browser always sends Origin; non-browser clients (tests, CLI) do not.
-    if origin is not None and allowed and origin not in allowed:
-        log.warning("rejected WebSocket from disallowed origin %s", origin)
+    if not _origin_allowed(websocket):
+        log.warning("rejected WebSocket from disallowed origin")
         return False
 
     expected = _configured_token()
     if expected is None:
+        return True
+    if _valid_session(websocket.cookies.get(_SESSION_COOKIE, "")):
         return True
     supplied = websocket.query_params.get("token", "")
     auth = websocket.headers.get("authorization", "")
@@ -239,12 +310,33 @@ def _feed_drift_monitor(
         confirmed_benign = [
             flow
             for flow, (layer_scores, alert) in zip(flows, scored)
-            if not is_actionable_alert(layer_scores, alert)
+            if _benign_consensus(layer_scores)
         ]
         if confirmed_benign:
             submit_confirmed_benign(confirmed_benign)
     except Exception:
         log.exception("drift monitoring failed (scoring unaffected)")
+
+
+def _benign_consensus(scores: List[LayerScore]) -> bool:
+    """Conservative admission policy; suppression alone is not benign evidence.
+
+    These are model-selected candidates, not independently verified labels.
+    Automatic retraining remains disabled.
+    """
+    layers = {score.layer_name: score for score in scores}
+    if not {"rules", "stats", "isoforest", "xgb"} <= layers.keys():
+        return False
+    classifier = layers["xgb"]
+    return (
+        classifier.threat_class_guess == "benign"
+        and classifier.calibrated_probability >= 0.9
+        and all(
+            layers[name].threat_class_guess in (None, "benign")
+            and layers[name].raw_score <= 0.25
+            for name in ("rules", "stats", "isoforest")
+        )
+    )
 
 
 def _log_broadcast_failure(fut) -> None:
@@ -322,7 +414,12 @@ class CaptureController:
     ) -> None:
         try:
             _ensure_stats_baseline()
-            for window_flows in extract_flows_from_interface(interface, window_ms, stop_event):
+            if interface.startswith("udp:"):
+                stream = extract_flows_from_udp(port=int(interface.split(":")[1]), bind=os.environ.get("IGU_UDP_BIND", "0.0.0.0"), window_ms=window_ms,
+                                                stop_event=stop_event, counters=self.state)
+            else:
+                stream = extract_flows_from_interface(interface, window_ms, stop_event, counters=self.state)
+            for window_flows in stream:
                 if stop_event.is_set():
                     break
                 # First yielded window (even empty) confirms capture is live.
@@ -549,6 +646,19 @@ async def health_check():
     return {"status": "ok", "service": "IGU Sentinel"}
 
 
+@app.get("/ready")
+async def readiness():
+    """Readiness includes loaded models and the configured ingest worker."""
+    from igu_sentinel.detect import isoforest, xgb
+    models_ready = isoforest._current_state() is not None and xgb._current_state() is not None
+    ingest_ready = capture.state.get("status") != "error"
+    if os.environ.get("IGU_UDP_PORT"):
+        ingest_ready = ingest_ready and capture.is_running()
+    ready = models_ready and ingest_ready
+    return JSONResponse({"status": "ready" if ready else "not_ready", "models_ready": models_ready,
+                         "ingest_ready": ingest_ready}, status_code=200 if ready else 503)
+
+
 @app.websocket("/ws/alerts")
 async def websocket_alerts(websocket: WebSocket):
     """WebSocket endpoint streaming alerts in real-time as flows are processed.
@@ -720,25 +830,7 @@ async def capture_status():
 
 @app.get("/dashboard")
 async def dashboard():
-    """Serve the live demo dashboard HTML.
-
-    When IGU_API_TOKEN is configured the HTML is patched to include a
-    ``<meta name="iguToken">`` tag that the dashboard's JavaScript reads to
-    authenticate its WebSocket connection.  Without the token the dashboard
-    is served as-is and the WebSocket handshake skips auth (consistent with
-    IGU_API_TOKEN being unset on the backend).
-
-    FileResponse is not used here because it streams the file directly
-    without giving the server a chance to modify it.  HTMLResponse accepts a
-    string, which is cheap for a ~18 KB HTML file.
-    """
+    """Serve public dashboard assets; credentials are supplied only by the operator."""
     dashboard_file = Path(__file__).parent / "dashboard.html"
     html = dashboard_file.read_text(encoding="utf-8")
-    token = _configured_token()
-    if token:
-        # Inject the token as a meta tag right after <head> so the JS can
-        # read it without any template engine dependency.
-        meta_tag = f'\n    <meta name="iguToken" content="{token}">'
-        html = html.replace("<head>", f"<head>{meta_tag}", 1)
-    return HTMLResponse(content=html)
-
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})

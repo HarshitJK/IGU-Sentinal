@@ -16,6 +16,8 @@ import threading
 import time
 import hashlib
 import struct
+import tempfile
+import socket
 from collections import defaultdict, deque, OrderedDict
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Iterable, Iterator, Optional
@@ -26,6 +28,37 @@ from igu_sentinel.ingest.ja4 import compute_ja4, parse_tshark_fields_line
 
 # Fixed 120ms capture window (locked in CLAUDE.md — deliberately NOT adaptive).
 DEFAULT_WINDOW_MS = 120
+
+
+def extract_flows_from_udp(port=9000, bind="0.0.0.0", window_ms=DEFAULT_WINDOW_MS,
+                           stop_event=None, counters=None):
+    """Receive one JSON FlowRecord per datagram. No replies, probes or ACKs.
+
+    Intended for a simulated diode carrying exported flow metadata. The kernel
+    receive buffer and each scoring batch are bounded; UDP delivery is best effort.
+    """
+    stop_event = stop_event or threading.Event()
+    counters = counters if counters is not None else {}
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+        receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+        receiver.bind((bind, port))
+        while not stop_event.is_set():
+            deadline = time.monotonic() + window_ms / 1000
+            batch = []
+            while len(batch) < 512 and not stop_event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                receiver.settimeout(remaining)
+                try:
+                    payload, _sender = receiver.recvfrom(65535)
+                except socket.timeout:
+                    break
+                try:
+                    batch.append(FlowRecord.model_validate_json(payload))
+                except ValueError:
+                    counters["invalid_datagrams"] = counters.get("invalid_datagrams", 0) + 1
+            yield batch
 
 # How long to wait after spawning live tshark before deciding it started cleanly.
 # A bad interface name or missing capture permission makes tshark exit within
@@ -65,35 +98,52 @@ _flow_arrivals: "OrderedDict[Tuple, Any]" = OrderedDict()
 _source_targets: "OrderedDict[str, Dict[Tuple[str, int], float]]" = OrderedDict()
 
 
+class FlowState:
+    """Behavioural history owned by one capture/replay, never shared across inputs."""
+    def __init__(self, arrivals=None, targets=None):
+        self.arrivals = arrivals if arrivals is not None else OrderedDict()
+        self.targets = targets if targets is not None else OrderedDict()
+        self.fingerprints = OrderedDict()
+
+
+_default_flow_state = FlowState(_flow_arrivals, _source_targets)
+
+
 def reset_flow_state() -> None:
     """Clear all cross-window state (tests, and between capture sessions)."""
     with _state_lock:
         _flow_arrivals.clear()
         _source_targets.clear()
+        _default_flow_state.fingerprints.clear()
 
 
-def _record_arrival(flow_key: Tuple, ts: float) -> Optional[Dict[str, float]]:
+def _record_arrival(flow_key: Tuple, ts: float, state=None) -> Optional[Dict[str, float]]:
     """Record a flow's arrival and return beacon interval stats once known.
 
     Returns None until enough callbacks have been seen to estimate an interval,
     so a flow is never described as beaconing on the strength of one packet.
     """
+    state = state or _default_flow_state
+    # Reconnects use new ephemeral source ports but belong to the same callback series.
+    if len(flow_key) == 5:
+        flow_key = (flow_key[0], flow_key[2], flow_key[3], flow_key[4])
     with _state_lock:
-        arrivals = _flow_arrivals.get(flow_key)
+        arrivals = state.arrivals.get(flow_key)
         if arrivals is None:
             arrivals = deque(maxlen=_MAX_ARRIVALS_PER_FLOW)
-            _flow_arrivals[flow_key] = arrivals
+            state.arrivals[flow_key] = arrivals
         else:
-            _flow_arrivals.move_to_end(flow_key)
-        arrivals.append(ts)
-        while len(_flow_arrivals) > _MAX_TRACKED_FLOWS:
-            _flow_arrivals.popitem(last=False)   # evict least recently seen
+            state.arrivals.move_to_end(flow_key)
+        if not arrivals or int(ts * 1000) // DEFAULT_WINDOW_MS != int(arrivals[-1] * 1000) // DEFAULT_WINDOW_MS:
+            arrivals.append(ts)
+        while len(state.arrivals) > _MAX_TRACKED_FLOWS:
+            state.arrivals.popitem(last=False)   # evict least recently seen
         snapshot = list(arrivals)
 
     # Need at least 3 gaps (4 callbacks) before an interval means anything.
     if len(snapshot) < 4:
         return None
-    cutoff = snapshot[-1] - FLOW_STATE_HORIZON_S
+    cutoff = snapshot[-1] - 1200.0
     recent = [t for t in snapshot if t >= cutoff]
     if len(recent) < 4:
         return None
@@ -106,7 +156,7 @@ def _record_arrival(flow_key: Tuple, ts: float) -> Optional[Dict[str, float]]:
     }
 
 
-def _record_target(src_ip: str, dst_ip: str, dst_port: int, ts: float) -> int:
+def _record_target(src_ip: str, dst_ip: str, dst_port: int, ts: float, state=None) -> int:
     """Record a contacted target and return the source's decayed fan-out.
 
     Fan-out was previously counted only within a single 120ms window, so an
@@ -114,21 +164,25 @@ def _record_target(src_ip: str, dst_ip: str, dst_port: int, ts: float) -> int:
     under the threshold forever. Counting over a decaying horizon makes pacing
     stop working as an evasion.
     """
+    state = state or _default_flow_state
     with _state_lock:
-        targets = _source_targets.get(src_ip)
+        targets = state.targets.get(src_ip)
         if targets is None:
             targets = {}
-            _source_targets[src_ip] = targets
+            state.targets[src_ip] = targets
         else:
-            _source_targets.move_to_end(src_ip)
+            state.targets.move_to_end(src_ip)
         targets[(dst_ip, dst_port)] = ts
+        # Bound per-source cardinality as well as the number of tracked sources.
+        while len(targets) > 4096:
+            del targets[next(iter(targets))]
 
         cutoff = ts - FLOW_STATE_HORIZON_S
         for key in [k for k, seen in targets.items() if seen < cutoff]:
             del targets[key]
 
-        while len(_source_targets) > _MAX_TRACKED_SOURCES:
-            _source_targets.popitem(last=False)
+        while len(state.targets) > _MAX_TRACKED_SOURCES:
+            state.targets.popitem(last=False)
         return len(targets)
 
 
@@ -334,53 +388,94 @@ def _extract_ja4_map(pcap_path: str) -> Dict[Tuple[str, int, str, int, str], str
 
 
 def extract_flows_from_pcap(pcap_path: str) -> List[FlowRecord]:
+    """Compatibility collector; each record still uses live-style fixed windows.
+
+    Streaming callers should consume iter_flows_from_pcap instead.
     """
-    Extract flows from a pcap file using tshark.
+    return [flow for window in iter_flows_from_pcap(pcap_path) for flow in window]
 
-    Args:
-        pcap_path: Path to pcap file
 
-    Returns:
-        List of FlowRecord objects
-    """
-    # Extract JA4 fingerprints for any TLS/QUIC handshakes
-    ja4_map = _extract_ja4_map(pcap_path)
+def iter_flows_from_pcap(pcap_path: str) -> Iterator[List[FlowRecord]]:
+    """Stream packet JSON from tshark; never load the whole capture into memory."""
+    with tempfile.TemporaryFile(mode="w+") as errors:
+        try:
+            proc = subprocess.Popen(["tshark", "-r", str(pcap_path), "-n", "-T", "json", "--no-duplicate-keys"],
+                                    stdout=subprocess.PIPE, stderr=errors, text=True)
+        except FileNotFoundError as exc:
+            raise RuntimeError("tshark not found in PATH") from exc
+        try:
+            yield from flow_windows_from_packets(_iter_json_objects(proc.stdout))
+            if proc.wait(timeout=10) != 0:
+                errors.seek(0)
+                raise RuntimeError(f"tshark failed: {errors.read(4096)}")
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            if proc.stdout:
+                proc.stdout.close()
 
-    # Run tshark to extract packets in JSON format
+
+def _packet_epoch(packet):
+    frame = packet.get("_source", {}).get("layers", {}).get("frame", {})
+    value = frame.get("frame.time_epoch") or frame.get("frame_time_epoch") or frame.get("frame.time") or 0
     try:
-        result = subprocess.run(
-            [
-                "tshark",
-                "-r", pcap_path,
-                "-T", "json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"tshark timeout reading {pcap_path}")
-    except FileNotFoundError:
-        raise RuntimeError("tshark not found in PATH")
+        return float(value)
+    except (TypeError, ValueError):
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
 
-    if result.returncode != 0:
-        raise RuntimeError(f"tshark failed: {result.stderr}")
 
-    if not result.stdout.strip():
-        return []
+class PacketWindow:
+    """Shared capture-time windowing for both tshark live capture and replay."""
+    def __init__(self, window_ms=DEFAULT_WINDOW_MS, counters=None):
+        self.window_ms = window_ms
+        self.bucket = None
+        self.last_bucket = -1
+        self.packets = []
+        self.state = FlowState()
+        self.counters = counters if counters is not None else {}
 
-    # Parse JSON output
-    try:
-        packets = json.loads(result.stdout)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Failed to parse tshark JSON output: {e}")
+    def push(self, packet):
+        bucket = int(_packet_epoch(packet) * 1000) // self.window_ms
+        if bucket < self.last_bucket or (self.bucket is not None and bucket < self.bucket):
+            self.counters["late_packets"] = self.counters.get("late_packets", 0) + 1
+            return None
+        ready = None
+        if self.bucket is not None and bucket != self.bucket:
+            ready = self.flush()
+        self.bucket = bucket
+        if len(self.packets) < 4096:
+            self.packets.append(packet)
+        else:
+            self.counters["packets_dropped"] = self.counters.get("packets_dropped", 0) + 1
+        return ready
 
-    return _build_flow_records(packets, ja4_map)
+    def flush(self):
+        packets, self.packets = self.packets, []
+        if self.bucket is not None:
+            self.last_bucket = self.bucket
+        self.bucket = None
+        return _build_flow_records(packets, _ja4_from_packets(packets), state=self.state)
+
+
+def flow_windows_from_packets(packets, window_ms=DEFAULT_WINDOW_MS):
+    window = PacketWindow(window_ms)
+    for packet in packets:
+        ready = window.push(packet)
+        if ready is not None:
+            yield ready
+    if window.packets:
+        yield window.flush()
 
 
 def _build_flow_records(
     packets: List[Dict[str, Any]],
     ja4_map: Optional[Dict[Tuple[str, int, str, int, str], str]] = None,
+    state=None,
 ) -> List[FlowRecord]:
     """Group tshark packet dicts into flows and build FlowRecords.
 
@@ -399,6 +494,7 @@ def _build_flow_records(
     Returns:
         List of FlowRecord objects, one per distinct 5-tuple flow.
     """
+    state = state or _default_flow_state
     if ja4_map is None:
         ja4_map = {}
 
@@ -412,22 +508,8 @@ def _build_flow_records(
         ttl = _get_ttl(packet)
         payload = _get_payload(packet)
 
-        # Get packet timestamp
-        frame = packet.get("_source", {}).get("layers", {}).get("frame", {})
-        timestamp_str = frame.get("frame.time_epoch") or frame.get("frame_time_epoch") or frame.get("frame.time")
-        timestamp = 0.0
-        if timestamp_str:
-            try:
-                timestamp = float(timestamp_str)
-            except (ValueError, TypeError):
-                try:
-                    clean_ts = str(timestamp_str).rstrip("Z")
-                    if "." in clean_ts:
-                        base, frac = clean_ts.split(".", 1)
-                        clean_ts = f"{base}.{frac[:6]}"
-                    timestamp = datetime.fromisoformat(clean_ts).timestamp()
-                except Exception:
-                    timestamp = 0.0
+        # Use the same parser for capture-time windowing and record timestamps.
+        timestamp = _packet_epoch(packet)
 
         flows_data[flow_key].append({
             "size": packet_size,
@@ -523,7 +605,7 @@ def _build_flow_records(
         # separate them. SHA-256 rather than MD5: the truncation to 64 bits
         # already makes collisions a practical concern over a long capture, and
         # there is no reason to start from a weaker digest.
-        window_epoch = int(timestamps[0]) if timestamps and timestamps[0] > 0 else int(time.time())
+        window_epoch = int((timestamps[0] if timestamps and timestamps[0] > 0 else time.time()) * 1000) // DEFAULT_WINDOW_MS
         flow_id = hashlib.sha256(
             f"{src_ip}:{src_port}:{dst_ip}:{dst_port}:{protocol}:{window_epoch}".encode()
         ).hexdigest()[:16]
@@ -536,8 +618,19 @@ def _build_flow_records(
         # burst inside one window counts once and the interval measured is the
         # callback period rather than the intra-burst packet spacing.
         first_ts = timestamps[0] if timestamps and timestamps[0] > 0 else time.time()
-        beacon_stats = _record_arrival(flow_key, first_ts)
-        fanout = _record_target(src_ip, dst_ip, dst_port, first_ts)
+        beacon_stats = _record_arrival(flow_key, first_ts, state)
+        fanout = _record_target(src_ip, dst_ip, dst_port, first_ts, state)
+        if flow_ja4:
+            state.fingerprints[flow_key] = (first_ts, flow_ja4)
+            state.fingerprints.move_to_end(flow_key)
+            while len(state.fingerprints) > _MAX_TRACKED_FLOWS:
+                state.fingerprints.popitem(last=False)
+        elif flow_key in state.fingerprints:
+            seen, cached_ja4 = state.fingerprints[flow_key]
+            if 0 <= first_ts - seen <= FLOW_STATE_HORIZON_S:
+                flow_ja4 = cached_ja4
+            else:
+                del state.fingerprints[flow_key]
 
         # Create FlowRecord
         flow_record = FlowRecord(
@@ -626,7 +719,7 @@ def _live_tshark_command(interface: str) -> List[str]:
     This still decrypts nothing: only Client Hello metadata is read, which is
     sent in the clear before any session key exists.
     """
-    return ["tshark", "-i", interface, "-l", "-n", "-J", "tls ip tcp udp frame dns", "-T", "json"]
+    return ["tshark", "-i", interface, "-l", "-n", "-J", "tls ip tcp udp frame dns", "-T", "json", "--no-duplicate-keys"]
 
 
 def _ja4_from_packets(
@@ -668,6 +761,10 @@ def _ja4_from_packets(
             return [f for f in found if f not in ("", None)]
 
         flow_key = _get_flow_key(packet)
+        native_ja4 = collect("tls.handshake.ja4")
+        if native_ja4:
+            out[flow_key] = native_ja4[0]
+            continue
         src_ip, src_port, dst_ip, dst_port, protocol = flow_key
         ciphers = collect("tls.handshake.ciphersuite")
         exts = collect("tls.handshake.extension.type")
@@ -685,6 +782,7 @@ def _ja4_from_packets(
                 alpn=alpn[0] if alpn else None,
                 sni=sni[0] if sni else None,
                 supported_versions=versions,
+                signature_algorithms=collect("tls.handshake.sig_hash_alg"),
             )
         except Exception:
             # JA4 is best effort: a malformed handshake must not stop the
@@ -698,6 +796,7 @@ def extract_flows_from_interface(
     window_ms: int = DEFAULT_WINDOW_MS,
     stop_event: Optional[threading.Event] = None,
     _popen=None,
+    counters=None,
 ) -> Iterator[List[FlowRecord]]:
     """Continuously capture on a live interface, yielding FlowRecords per window.
 
@@ -758,46 +857,38 @@ def extract_flows_from_interface(
         )
 
     # ── Reader thread: parse packet objects off tshark stdout into a queue. ──
-    pkt_q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
-    _EOF = None  # sentinel
+    counters = counters if counters is not None else {}
+    pkt_q = queue.Queue(maxsize=8192)
+    reader_done = threading.Event()
 
-    def _reader() -> None:
+    def _reader():
         try:
             if proc.stdout is not None:
                 for obj in _iter_json_objects(proc.stdout):
-                    pkt_q.put(obj)
-        except Exception:
-            pass
+                    try:
+                        pkt_q.put_nowait(obj)
+                    except queue.Full:
+                        counters["packets_dropped"] = counters.get("packets_dropped", 0) + 1
         finally:
-            pkt_q.put(_EOF)
+            reader_done.set()
 
     reader = threading.Thread(target=_reader, name="tshark-reader", daemon=True)
     reader.start()
-
-    window_s = window_ms / 1000.0
-    eof = False
+    window = PacketWindow(window_ms, counters)
     try:
-        while not eof:
+        while not (reader_done.is_set() and pkt_q.empty()):
             if stop_event is not None and stop_event.is_set():
                 break
-            window_start = time.monotonic()
-            packets: List[Dict[str, Any]] = []
-            while True:
-                remaining = window_s - (time.monotonic() - window_start)
-                if remaining <= 0:
-                    break
-                try:
-                    item = pkt_q.get(timeout=remaining)
-                except queue.Empty:
-                    break
-                if item is _EOF:
-                    eof = True
-                    break
-                packets.append(item)
-
-            # JA4 is extracted from the Client Hellos in this window, so the
-            # live path now produces the same fingerprints the pcap path does.
-            yield _build_flow_records(packets, ja4_map=_ja4_from_packets(packets))
+            try:
+                item = pkt_q.get(timeout=window_ms / 1000)
+            except queue.Empty:
+                yield window.flush()  # bounded idle latency, even without the next packet
+                continue
+            ready = window.push(item)
+            if ready is not None:
+                yield ready
+        if window.packets:
+            yield window.flush()
     finally:
         # Terminate tshark so the reader thread unblocks and no orphan remains.
         try:

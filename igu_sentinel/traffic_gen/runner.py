@@ -158,20 +158,44 @@ def run_all_configs(config_dir: str | None = None, allow_lab: bool = False) -> L
     return all_flows
 
 
+def main(argv=None):
+    import argparse
+    import socket
+    import time
+
+    parser = argparse.ArgumentParser(description="Generate mock flows or explicitly selected lab traffic")
+    parser.add_argument("config", nargs="?")
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--allow-lab", action="store_true", help="Enable real traffic in the selected config only")
+    parser.add_argument("--send-to", help="Send flow JSON datagrams to IPv4:port (no return path)")
+    parser.add_argument("--rate", type=float, default=20, help="Flow export rate per second")
+    parser.add_argument("--repeat", action="store_true", help="Repeat the generated flow corpus")
+    args = parser.parse_args(argv)
+    if args.all == bool(args.config):
+        parser.error("choose either a config or --all")
+    if args.allow_lab and args.all:
+        parser.error("--allow-lab requires a single explicit config")
+    if args.rate <= 0:
+        parser.error("--rate must be positive")
+    rows = run_all_configs(allow_lab=False) if args.all else run_traffic_gen(args.config, allow_lab=args.allow_lab)
+    if args.send_to and rows:
+        host, port = args.send_to.rsplit(":", 1)
+        # Interleave classes for a short demonstration rather than spending
+        # many minutes exporting the first class in the config directory.
+        from itertools import zip_longest
+        groups = {}
+        for row in rows:
+            groups.setdefault(row["threat_class"], []).append(row)
+        rows = [r for group in zip_longest(*groups.values()) for r in group if r is not None]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            while True:
+                for row in rows:
+                    sender.sendto(row["flow"].model_dump_json().encode(), (host, int(port)))
+                    time.sleep(1 / args.rate)
+                if not args.repeat:
+                    break
+    return 0
+
+
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) < 2:
-        print("Usage: python -m igu_sentinel.traffic_gen.runner <config.yaml | --all>")
-        sys.exit(1)
-
-    arg = sys.argv[1]
-
-    # A direct CLI invocation is an explicit, human-initiated run, so it is
-    # allowed to execute lab variants (this is how `make gen-data-lab` fires the
-    # real generators). Library/aggregate callers keep the CI-safe default.
-    if arg == "--all":
-        run_all_configs(allow_lab=True)
-    else:
-        run_traffic_gen(arg, allow_lab=True)
-
+    raise SystemExit(main())

@@ -10,17 +10,10 @@ import type { CaptureSnapshot, CaptureStartRequest, HealthResponse } from './typ
 // In production, set VITE_API_BASE_URL to the actual backend origin.
 const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '';
 
-// When IGU_API_TOKEN is configured on the backend, set VITE_API_TOKEN in the
-// build environment to the same value.  The token lives in the browser bundle
-// (acceptable for a controlled-network demo); a real deployment should use
-// a login endpoint that issues short-lived session cookies instead.
-const TOKEN = (import.meta.env.VITE_API_TOKEN as string | undefined) ?? '';
-
 /** Derive WebSocket URL from the REST API base URL.
  *
- * Browsers cannot set custom headers on a WebSocket handshake, so the token
- * is passed as a query parameter instead — the backend's require_ws_token()
- * already reads websocket.query_params.get("token").
+ * Browser authentication uses the HTTP-only cookie obtained at sign-in.
+ * Credentials are never embedded in the bundle or WebSocket URL.
  */
 export function wsUrl(): string {
   // If BASE_URL is empty (proxy mode), use the current page's host.
@@ -28,9 +21,6 @@ export function wsUrl(): string {
   const u = new URL(base);
   u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
   u.pathname = '/ws/alerts';
-  if (TOKEN) {
-    u.searchParams.set('token', TOKEN);
-  }
   return u.toString();
 }
 
@@ -42,11 +32,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     'Content-Type': 'application/json',
     ...(options?.headers as Record<string, string>),
   };
-  // Attach Bearer token when the backend has auth enabled.
-  if (TOKEN) {
-    headers['Authorization'] = `Bearer ${TOKEN}`;
-  }
-  const res = await fetch(url, { ...options, headers });
+  const res = await fetch(url, { ...options, headers, credentials: 'include' });
 
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
@@ -81,4 +67,14 @@ export async function startCapture(req: CaptureStartRequest): Promise<CaptureSna
 
 export async function stopCapture(): Promise<CaptureSnapshot> {
   return request<CaptureSnapshot>('/capture/stop', { method: 'POST' });
+}
+
+export function authStatus(): Promise<{ required: boolean; authenticated: boolean }> {
+  return request('/auth/status');
+}
+export function login(token: string): Promise<{ authenticated: boolean }> {
+  return request('/auth/login', { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+}
+export function logout(): Promise<{ authenticated: boolean }> {
+  return request('/auth/logout', { method: 'POST' });
 }

@@ -18,7 +18,8 @@ pydantic>=2.0.0,<3.0.0
 # ── ML / numerics ────────────────────────────────────────────────────────────
 numpy>=1.20.0,<3.0.0
 scikit-learn>=1.0.0,<2.0.0
-xgboost>=1.7.0,<2.0.0
+# Match the served JSON model format; CPU-only avoids GPU runtime dependencies.
+xgboost-cpu==3.4.1
 # Direct dependency: detect/isoforest.py imports joblib to persist and load
 # model bundles. It was previously absent here and only present transitively via
 # scikit-learn — so the pipeline's model persistence depended on another

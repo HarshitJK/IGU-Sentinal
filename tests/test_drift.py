@@ -306,3 +306,24 @@ def test_rollback_without_snapshot_reports_failure():
     reset_retrain_log()
     assert rollback_to_baseline() is False
     print("✓ test_rollback_without_snapshot_reports_failure passed")
+
+
+def test_unemitted_threats_are_not_confirmed_benign():
+    from igu_sentinel.api import _feed_drift_monitor
+    from igu_sentinel.schemas import LayerScore
+    from igu_sentinel.fusion import fuse_layers
+    flow = _load("benign")[0]
+    scores = [LayerScore(flow_id=flow.flow_id, layer_name=name, raw_score=.1,
+                         calibrated_probability=.1, threat_class_guess=None, evidence=[])
+              for name in ("rules", "stats", "isoforest")]
+    scores.append(LayerScore(flow_id=flow.flow_id, layer_name="xgb", raw_score=.55,
+                             calibrated_probability=.55, threat_class_guess="data_exfiltration", evidence=[]))
+    _feed_drift_monitor([(scores, fuse_layers(scores))], [flow])
+    assert get_retrain_pool_size() == 0
+
+
+def test_retrain_pool_has_a_hard_capacity():
+    from igu_sentinel.drift import MAX_RETRAIN_SAMPLES
+    flow = _load("benign")[0]
+    submit_confirmed_benign([flow] * (MAX_RETRAIN_SAMPLES + 100))
+    assert get_retrain_pool_size() == MAX_RETRAIN_SAMPLES
